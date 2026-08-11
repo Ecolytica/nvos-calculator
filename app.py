@@ -10,7 +10,8 @@ import numpy as np
 # Настройка страницы
 st.set_page_config(
     page_title="Расчет платы за выбросы в атмосферу",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 def load_ecolytica_styles():
@@ -23,11 +24,6 @@ load_ecolytica_styles()
 
 st.markdown(
     """
-    <div class="eco-brandbar">
-      <div class="eco-logo" aria-hidden="true"><span></span></div>
-      <div class="eco-brand-name">Ecolytica</div>
-      <div class="eco-breadcrumb">/ Калькуляторы</div>
-    </div>
     <div class="eco-page-head">
       <div class="eco-eyebrow">ПЛАТА ЗА НВОС · СТАВКИ 2026</div>
       <h1>Расчёт платы за выбросы в атмосферу</h1>
