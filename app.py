@@ -4,22 +4,39 @@ import io
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
 import numpy as np
 
 # Настройка страницы
 st.set_page_config(
     page_title="Расчет платы за выбросы в атмосферу",
-    page_icon="💰",
     layout="wide"
 )
 
-st.markdown(
-    "<style>[data-testid='stElementToolbar'] { display: none; }</style>",
-    unsafe_allow_html=True
-)
+def load_ecolytica_styles():
+    """Подключает локальную тему Ecolytica."""
+    css_path = Path(__file__).parent / "assets" / "ecolytica.css"
+    st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 
-st.title("💰 Расчет платы за выбросы в атмосферу по Распоряжению Правительства РФ от 01.09.2025 N 2409-р (ставки на 2026)")
-st.markdown("##### Загрузите файл с нормативами выбросов (из программы ПДВ)")
+
+load_ecolytica_styles()
+
+st.markdown(
+    """
+    <div class="eco-brandbar">
+      <div class="eco-logo" aria-hidden="true"><span></span></div>
+      <div class="eco-brand-name">Ecolytica</div>
+      <div class="eco-breadcrumb">/ Калькуляторы</div>
+    </div>
+    <div class="eco-page-head">
+      <div class="eco-eyebrow">ПЛАТА ЗА НВОС · СТАВКИ 2026</div>
+      <h1>Расчёт платы за выбросы в атмосферу</h1>
+      <p>По Распоряжению Правительства РФ от 01.09.2025 № 2409-р</p>
+    </div>
+    <div class="eco-section-label">Исходные данные</div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ============================================
 # СТАВКИ ТОЛЬКО ИЗ ФАЙЛА Ставки+код.xlsx
@@ -433,14 +450,24 @@ def add_total_row(df):
 
 # Загрузка файла с выбросами
 emissions_file = st.file_uploader(
-    "📋 Загрузите файл с выбросами (формат ПДВ)",
+    "Файл с нормативами выбросов (формат ПДВ)",
     type=['xls', 'csv', 'txt'],
-    help="Загрузите XLS-файл ПДВ по инструкции слева ;"
+    help="Загрузите исходный XLS-файл ПДВ без изменений либо CSV/TXT с разделителем «;»."
 )
 
 # Настройка коэффициентов в сайдбаре
 with st.sidebar:
-    st.header("⚙️ Настройки расчета")
+    st.markdown(
+        """
+        <div class="eco-sidebar-brand">
+          <div class="eco-logo" aria-hidden="true"><span></span></div>
+          <div><strong>Ecolytica</strong><small>Калькулятор НВОС</small></div>
+        </div>
+        <div class="eco-section-label eco-sidebar-label">Параметры</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.header("Настройки расчёта")
     
     st.subheader("Коэффициенты для расчета платы")
     
@@ -462,7 +489,7 @@ with st.sidebar:
     
         
     # Поиск по коду
-    with st.expander("🔍 Поиск ставки по коду"):
+    with st.expander("Поиск ставки по коду"):
         search_code = st.text_input("Введите код вещества (4 цифры)")
         if search_code:
             code_padded = search_code.zfill(4)
@@ -475,7 +502,7 @@ with st.sidebar:
 
 # Основная логика расчета
 if emissions_file is not None:
-    with st.spinner('🔄 Обработка файла с выбросами...'):
+    with st.spinner('Обработка файла с выбросами...'):
         # Выбираем парсер по расширению файла
         fname = emissions_file.name.lower()
         if fname.endswith('.xls'):
@@ -508,24 +535,24 @@ if emissions_file is not None:
             total_emission = df_result['Валовый выброс, т/год'].sum()
             substances_with_rate = df_result['Ставка платы, руб.'].notna().sum()
             
-            st.success(f"✅ Успешно найдено {len(df_result)} записей!")
+            st.success(f"Обработка завершена: найдено записей — {len(df_result)}")
             
             # Отображаем итоговую сумму
-            st.markdown("---")
+            st.markdown('<div class="eco-section-label eco-results-label">Результаты расчёта</div>', unsafe_allow_html=True)
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric(
-                    "💰 ИТОГО ПЛАТА",
+                    "Итого плата",
                     f"{total_payment:,.2f} руб" if pd.notna(total_payment) else "0 руб"
                 )
             with col2:
-                st.metric("📊 Всего веществ", len(df_result))
+                st.metric("Всего веществ", len(df_result))
             with col3:
-                st.metric("✅ Найдено ставок", f"{substances_with_rate} из {len(df_result)}")
+                st.metric("Найдено ставок", f"{substances_with_rate} из {len(df_result)}")
             
             # Отображаем выбранные коэффициенты
             st.info(f"**Выбранные коэффициенты:** Квр = {kvr}, Кпр = {kpr}")
-            st.markdown("---")
+            st.markdown('<div class="eco-table-label">Расчёт по веществам</div>', unsafe_allow_html=True)
             
             # Таблица результатов
             display_columns = ['Наименование вещества', 'Валовый выброс, т/год',
@@ -539,7 +566,7 @@ if emissions_file is not None:
             )
             
             # НОВЫЙ БЛОК: Кнопка для скачивания в формате Excel с итоговой строкой
-            st.subheader("💾 Скачать результаты")
+            st.subheader("Экспорт результатов")
             
             # Подготавливаем данные для экспорта
             export_df = df_result[['Наименование вещества', 'Валовый выброс, т/год',
@@ -593,7 +620,7 @@ if emissions_file is not None:
             filename = f"raschet_platy_{current_date}.xlsx"
             
             st.download_button(
-                label="📥 Скачать результаты в Excel",
+                label="Скачать результаты в Excel",
                 data=output,
                 file_name=filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -601,12 +628,12 @@ if emissions_file is not None:
             )
                 
         else:
-            st.error("❌ Не удалось извлечь данные из файла. Проверьте, что файл имеет правильный формат.")
+            st.error("Не удалось извлечь данные из файла. Проверьте, что файл имеет правильный формат.")
 
 # Инструкция в сайдбаре
 with st.sidebar:
     st.divider()
-    st.header("ℹ️ Инструкция")
+    st.header("Инструкция")
     
     st.markdown("""
     ### Как пользоваться:
