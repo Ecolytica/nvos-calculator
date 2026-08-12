@@ -1,5 +1,9 @@
 # Калькулятор платы за выбросы в атмосферу Ecolytica
 
+[![Открыть приложение Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://ecolytica-nvos.streamlit.app/)
+
+Приложение: [ecolytica-nvos.streamlit.app](https://ecolytica-nvos.streamlit.app/)
+
 Streamlit-приложение для переноса нормативов выбросов из файла программы ПДВ-Эколог и расчёта платы за негативное воздействие на окружающую среду.
 
 ## Возможности
