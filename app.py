@@ -4,9 +4,19 @@ import io
 import json
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import numpy as np
+
+from analytics import (
+    flush_events,
+    queue_event,
+    render_feedback,
+    render_page_view,
+    render_sidebar_about,
+    render_social_button,
+)
 
 # Настройка страницы
 st.set_page_config(
@@ -22,6 +32,7 @@ def load_ecolytica_styles():
 
 
 load_ecolytica_styles()
+render_page_view()
 
 st.markdown(
     """
@@ -528,28 +539,69 @@ def parse_emissions_file(uploaded_file):
         st.error(f"Ошибка при чтении файла: {str(e)}")
         return None
 
+@dataclass
+class XlsParseResult:
+    """Результат парсинга без передачи технических деталей в аналитику."""
+
+    dataframe: pd.DataFrame | None
+    error_category: str | None = None
+    user_message: str | None = None
+
+    @property
+    def success(self):
+        return self.dataframe is not None and not self.dataframe.empty
+
+
+def _empty_emissions_dataframe():
+    return pd.DataFrame(columns=[
+        'Позиция 2909-р',
+        'Код вещества',
+        'Коды ставок',
+        'Наименование вещества',
+        'Валовый выброс, т/год',
+    ])
+
+
 def parse_emissions_xls(uploaded_file):
     """
-    Парсит XLS-файл формата SpreadsheetML (XML-based, генерируется FastReport/ПДВ).
+    Парсит XLS-файл формата SpreadsheetML и возвращает безопасный статус.
     Колонка 1 — номер строки, колонка 2 — наименование вещества, колонка 6 — т/год.
     """
     try:
-        content = uploaded_file.read().decode('utf-8-sig')
+        raw_content = uploaded_file.read()
+        content = raw_content.decode('utf-8-sig')
+    except (OSError, UnicodeError) as exc:
+        return XlsParseResult(
+            None,
+            'read_error',
+            f"Ошибка при чтении XLS-файла: {exc}",
+        )
+
+    try:
         tree = ET.fromstring(content)
+    except ET.ParseError as exc:
+        return XlsParseResult(
+            None,
+            'invalid_xml',
+            f"Ошибка XML-разбора XLS-файла: {exc}",
+        )
+
+    try:
         SS_NS = 'urn:schemas-microsoft-com:office:spreadsheet'
         ns = {'ss': SS_NS}
-
         worksheets = tree.findall('.//ss:Worksheet', ns)
         if not worksheets:
-            st.error("В XLS-файле не найдено листов.")
-            return None
+            return XlsParseResult(
+                None,
+                'no_worksheets',
+                "В XLS-файле не найдено листов.",
+            )
 
         ws = worksheets[0]
         substances, emissions, codes = [], [], []
         rate_codes_list, positions_2909 = [], []
 
         for row_elem in ws.findall('.//ss:Row', ns):
-            # Восстанавливаем позиции ячеек с учётом ss:Index
             row_dict = {}
             col_idx = 1
             for cell in row_elem.findall('ss:Cell', ns):
@@ -560,7 +612,6 @@ def parse_emissions_xls(uploaded_file):
                 row_dict[col_idx] = data_elem.text if data_elem is not None else None
                 col_idx += 1
 
-            # Строки данных: первая колонка — целое число
             col1 = str(row_dict.get(1, '') or '').strip()
             if not col1.isdigit():
                 continue
@@ -584,26 +635,22 @@ def parse_emissions_xls(uploaded_file):
             rate_codes_list.append(rate_codes)
             positions_2909.append(position_2909)
 
-        if substances:
-            return pd.DataFrame({
-                'Позиция 2909-р': positions_2909,
-                'Код вещества': codes,
-                'Коды ставок': rate_codes_list,
-                'Наименование вещества': substances,
-                'Валовый выброс, т/год': emissions
-            })
-        else:
-            return pd.DataFrame(columns=[
-                'Позиция 2909-р',
-                'Код вещества',
-                'Коды ставок',
-                'Наименование вещества',
-                'Валовый выброс, т/год'
-            ])
+        if not substances:
+            return XlsParseResult(_empty_emissions_dataframe(), 'no_data')
 
-    except Exception as e:
-        st.error(f"Ошибка при чтении XLS-файла: {str(e)}")
-        return None
+        return XlsParseResult(pd.DataFrame({
+            'Позиция 2909-р': positions_2909,
+            'Код вещества': codes,
+            'Коды ставок': rate_codes_list,
+            'Наименование вещества': substances,
+            'Валовый выброс, т/год': emissions,
+        }))
+    except Exception as exc:
+        return XlsParseResult(
+            None,
+            'unexpected_error',
+            f"Ошибка при чтении XLS-файла: {exc}",
+        )
 
 
 def format_dataframe_for_display(df):
@@ -634,6 +681,18 @@ def add_total_row(df):
     })
     return pd.concat([df, total_row], ignore_index=True)
 
+def handle_emissions_file_change():
+    """Фиксирует новый выбор файла и сбрасывает кэш предыдущего разбора."""
+    st.session_state['_upload_revision'] = st.session_state.get('_upload_revision', 0) + 1
+    st.session_state.pop('_parsed_upload_key', None)
+    st.session_state.pop('_parsed_upload_result', None)
+    if st.session_state.get('emissions_file') is not None:
+        queue_event('file_uploaded')
+
+
+def handle_excel_download():
+    queue_event('excel_download')
+
 # Загрузка файла с выбросами
 st.markdown(
     """
@@ -643,7 +702,9 @@ st.markdown(
       <strong>Загрузите файл с нормативами выбросов</strong> из программы ПДВ-Эколог
       (сохранив его <strong>без изменений</strong> как Файл MS Excel (*.xls)).
       Не двигайте столбцы, не удаляйте строки в нем.
-      <div class="eco-privacy-note">Загруженный файл используется только для расчета и не сохраняется.</div>
+      <div class="eco-privacy-note">Загруженный файл используется только для расчета и не сохраняется.<br>
+      Для анализа использования применяется Google Analytics. Имена и содержимое файлов,
+      данные расчёта и суммы в аналитику не передаются.</div>
       </div>
     </div>
     """,
@@ -652,7 +713,9 @@ st.markdown(
 emissions_file = st.file_uploader(
     "Загрузите исходный файл ПДВ в формате .xls",
     type=['xls'],
-    help="Загрузите исходный файл ПДВ в формате .xls без изменений."
+    key='emissions_file',
+    on_change=handle_emissions_file_change,
+    help="Загрузите исходный файл ПДВ в формате .xls без изменений.",
 )
 
 # Настройка коэффициентов в сайдбаре
@@ -663,17 +726,12 @@ with st.sidebar:
           <div class="eco-logo" aria-hidden="true"><span></span></div>
           <div><strong>Ecolytica</strong></div>
         </div>
-        <div class="eco-sidebar-about">
-          <p>Эколог-проектировщик слишком много времени тратит на ручной поиск данных,
-          сверку таблиц и пересчет показателей.</p>
-          <p>Этот инструмент — помогает убрать ручную рутину из работы эколога.</p>
-          <div class="eco-sidebar-links">
-            <a href="https://t.me/ecology_start" target="_blank" rel="noopener noreferrer"><strong>Telegram:</strong> Только без рук</a>
-            <a href="https://vk.ru/ecolytica" target="_blank" rel="noopener noreferrer"><strong>ВК:</strong> Экология без ручной рутины | Ecolytica</a>
-          </div>
-        </div>
-        <div class="eco-section-label eco-sidebar-label">Параметры</div>
         """,
+        unsafe_allow_html=True,
+    )
+    render_sidebar_about()
+    st.markdown(
+        '<div class="eco-section-label eco-sidebar-label">Параметры</div>',
         unsafe_allow_html=True,
     )
     st.header("Настройки расчёта")
@@ -722,10 +780,28 @@ with st.sidebar:
 
 # Основная логика расчета
 if emissions_file is not None:
+    upload_key = st.session_state.get('_upload_revision', 0)
     with st.spinner('Обработка файла с выбросами...'):
-        df_result = parse_emissions_xls(emissions_file)
-        
-        if df_result is not None and not df_result.empty:
+        if st.session_state.get('_parsed_upload_key') != upload_key:
+            emissions_file.seek(0)
+            parse_result = parse_emissions_xls(emissions_file)
+            st.session_state['_parsed_upload_key'] = upload_key
+            st.session_state['_parsed_upload_result'] = parse_result
+            if parse_result.success:
+                queue_event('xls_parse_success')
+            else:
+                queue_event(
+                    'xls_parse_failed',
+                    error_category=parse_result.error_category or 'unexpected_error',
+                )
+        else:
+            parse_result = st.session_state['_parsed_upload_result']
+
+        df_result = parse_result.dataframe
+        if parse_result.user_message:
+            st.error(parse_result.user_message)
+
+        if parse_result.success:
             
             # Добавляем расчет платы
             payments = []
@@ -818,16 +894,16 @@ if emissions_file is not None:
             )
             telegram_col, vk_col = st.columns(2)
             with telegram_col:
-                st.link_button(
+                render_social_button(
                     "Подписаться в Telegram",
                     "https://t.me/ecology_start",
-                    use_container_width=True,
+                    "telegram",
                 )
             with vk_col:
-                st.link_button(
+                render_social_button(
                     "Вступить в ВК",
                     "https://vk.ru/ecolytica",
-                    use_container_width=True,
+                    "vk",
                 )
             
             # НОВЫЙ БЛОК: Кнопка для скачивания в формате Excel с итоговой строкой
@@ -893,15 +969,15 @@ if emissions_file is not None:
                 data=output,
                 file_name=filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                on_click=handle_excel_download,
+                use_container_width=True,
             )
                 
-        else:
-            if df_result is not None and df_result.empty:
-                st.error(
-                    "Данных не найдено, либо загруженный файл сохранен с изменениями. "
-                    "Повторно выгрузите файл из программы ПДВ и сохраните его без изменений."
-                )
+        elif parse_result.error_category == 'no_data':
+            st.error(
+                "Данных не найдено, либо загруженный файл сохранен с изменениями. "
+                "Повторно выгрузите файл из программы ПДВ и сохраните его без изменений."
+            )
 
 # Инструкция в сайдбаре
 with st.sidebar:
@@ -925,8 +1001,8 @@ with st.sidebar:
        """)
 
 st.markdown('<div class="eco-feedback-label">Обратная связь</div>', unsafe_allow_html=True)
-with st.expander("Сообщить об ошибке / предложить улучшение"):
-    st.markdown("Напишите мне на почту: **fedor.belyanin@gmail.com**")
+render_feedback()
+flush_events()
 
 st.markdown(
     '<footer class="eco-footer">Проект <strong>«Экология без ручной рутины | Ecolytica»</strong></footer>',

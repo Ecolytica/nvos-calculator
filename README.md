@@ -39,6 +39,18 @@ streamlit run app.py
 3. Выберите год ставок и коэффициенты.
 4. Проверьте расчёт и скачайте результат в формате `.xlsx`.
 
+## Аналитика
+
+Необязательная обезличенная аналитика работает через Google Analytics 4. Measurement ID задаётся только в секретах Streamlit:
+
+```toml
+GA4_MEASUREMENT_ID = "G-XXXXXXXXXX"
+```
+
+Без этого секрета приложение работает штатно, но события не отправляются. В GA4 используются события `page_view`, `file_uploaded`, `xls_parse_success`, `xls_parse_failed`, `excel_download`, `social_click` и `feedback_open`. Имена и содержимое файлов, данные расчёта и суммы не передаются.
+
+Для параметров `network`, `source` и `error_category` в GA4 нужно создать специальные параметры с областью действия «Событие».
+
 ## Ссылки
 
 - [Telegram: «Только без рук»](https://t.me/ecology_start)
