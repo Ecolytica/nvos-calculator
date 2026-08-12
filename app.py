@@ -27,7 +27,7 @@ st.markdown(
     """
     <div class="eco-page-head">
       <div class="eco-eyebrow">ПЛАТА ЗА НВОС</div>
-      <h1>Расчёт платы за выбросы в атмосферу</h1>
+      <h1>Калькулятор платы за выбросы в атмосферу</h1>
     </div>
     <div class="eco-section-label">Исходные данные</div>
     """,
@@ -238,7 +238,84 @@ SUBSTANCE_NAMES = {
     '2752': 'Уайт-спирит',
 }
 
+POSITION_CROSSWALK_PATH = (
+    Path(__file__).parent / "data" / "position_2909_to_rate_codes.json"
+)
 PAYMENT_RATES_PATH = Path(__file__).parent / "data" / "payment_rates.json"
+
+
+def load_position_crosswalk(path, expected_codes):
+    """Загружает соответствия позиций № 2909-р кодам ставок."""
+    try:
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"файл {path.name} не найден") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"ошибка JSON в строке {exc.lineno}, столбце {exc.colno}"
+        ) from exc
+
+    regulation = catalog.get("regulation") if isinstance(catalog, dict) else None
+    positions = catalog.get("positions") if isinstance(catalog, dict) else None
+    if not isinstance(regulation, str) or not regulation.strip():
+        raise ValueError("не указан источник regulation")
+    if not isinstance(positions, dict) or not positions:
+        raise ValueError("раздел positions отсутствует или пуст")
+
+    normalized = {}
+    code_positions = {}
+    for raw_position, raw_codes in positions.items():
+        position_text = str(raw_position).strip()
+        if not position_text.isdigit() or int(position_text) <= 0:
+            raise ValueError(f"некорректная позиция {raw_position!r}")
+        position_text = str(int(position_text))
+        if position_text in normalized:
+            raise ValueError(f"позиция {position_text} повторяется")
+        if not isinstance(raw_codes, list) or not raw_codes:
+            raise ValueError(f"для позиции {position_text} ожидается непустой список")
+
+        codes = []
+        for raw_code in raw_codes:
+            code = str(raw_code).strip()
+            if not re.fullmatch(r"\d{4}", code):
+                raise ValueError(
+                    f"некорректный код {raw_code!r} для позиции {position_text}"
+                )
+            if code in codes:
+                raise ValueError(
+                    f"код {code} повторяется в позиции {position_text}"
+                )
+            previous_position = code_positions.get(code)
+            if previous_position is not None:
+                raise ValueError(
+                    f"код {code} указан для позиций "
+                    f"{previous_position} и {position_text}"
+                )
+            code_positions[code] = position_text
+            codes.append(code)
+        normalized[position_text] = tuple(codes)
+
+    expected = set(expected_codes)
+    actual = set(code_positions)
+    if actual != expected:
+        missing = ", ".join(sorted(expected - actual)) or "нет"
+        extra = ", ".join(sorted(actual - expected)) or "нет"
+        raise ValueError(
+            f"состав кодов не совпадает со справочником "
+            f"(отсутствуют: {missing}; лишние: {extra})"
+        )
+
+    return normalized
+
+
+try:
+    POSITION_TO_RATE_CODES_2909 = load_position_crosswalk(
+        POSITION_CROSSWALK_PATH,
+        SUBSTANCE_NAMES,
+    )
+except ValueError as exc:
+    st.error(f"Не удалось загрузить таблицу соответствий № 2909-р: {exc}.")
+    st.stop()
 
 
 def load_payment_rates(path):
@@ -316,10 +393,44 @@ def find_rate_by_code(code, rates):
 
     return None
 
+def find_rate_by_codes(codes, rates):
+    """Возвращает ставку для одного кода или группы с одинаковыми ставками."""
+    if not codes:
+        return None
+
+    values = [find_rate_by_code(code, rates) for code in codes]
+    if any(value is None or pd.isna(value) for value in values):
+        return None
+
+    first_value = values[0]
+    if not all(
+        np.isclose(value, first_value, rtol=0, atol=1e-9)
+        for value in values[1:]
+    ):
+        return None
+    return first_value
+
+
+def extract_position_from_substance(substance):
+    """Извлекает позицию № 2909-р из начала наименования."""
+    match = re.match(r'^\s*\((\d+)\)', substance)
+    return str(int(match.group(1))) if match else None
+
+
+def extract_rate_codes_from_substance(substance):
+    """Получает коды ставок по позиции № 2909-р или старому коду в тексте."""
+    position = extract_position_from_substance(substance)
+    if position is not None:
+        return list(POSITION_TO_RATE_CODES_2909.get(position, ()))
+
+    code_match = re.search(r'(?<!\d)(\d{4})(?!\d)', substance)
+    return [code_match.group(1)] if code_match else []
+
+
 def extract_code_from_substance(substance):
-    """Извлекает код вещества из строки с названием (первые 4 цифры)"""
-    match = re.search(r'(\d{4})', substance)
-    return match.group(1) if match else None
+    """Совместимый интерфейс: возвращает первый найденный код ставки."""
+    codes = extract_rate_codes_from_substance(substance)
+    return codes[0] if codes else None
 
 def calculate_payment(emission, rate, kvr, kpr):
     """Рассчитывает плату за выбросы с учетом коэффициентов Квр и Кпр"""
@@ -351,6 +462,8 @@ def parse_emissions_file(uploaded_file):
         substances = []
         emissions = []
         codes = []
+        rate_codes_list = []
+        positions_2909 = []
         row_numbers = []
         
         for idx, row in df.iterrows():
@@ -378,8 +491,9 @@ def parse_emissions_file(uploaded_file):
                 # Очищаем название от кавычек если есть
                 substance = substance.strip('"').strip("'")
                 
-                # Извлекаем код вещества из названия (первые 4 цифры)
-                code = extract_code_from_substance(substance)
+                position_2909 = extract_position_from_substance(substance)
+                rate_codes = extract_rate_codes_from_substance(substance)
+                code = rate_codes[0] if rate_codes else None
                 
                 # Заменяем запятую на точку для числа и удаляем пробелы
                 emission_str = emission_str.replace(',', '.').replace(' ', '')
@@ -389,6 +503,8 @@ def parse_emissions_file(uploaded_file):
                     substances.append(substance)
                     emissions.append(emission)
                     codes.append(code)
+                    rate_codes_list.append(rate_codes)
+                    positions_2909.append(position_2909)
                     row_numbers.append(row_num)
                 except ValueError:
                     # Если не удалось преобразовать в число, пропускаем
@@ -397,7 +513,9 @@ def parse_emissions_file(uploaded_file):
         if substances:
             # Создаем DataFrame с нужными колонками
             result_df = pd.DataFrame({
+                'Позиция 2909-р': positions_2909,
                 'Код вещества': codes,
+                'Коды ставок': rate_codes_list,
                 'Наименование вещества': substances,
                 'Валовый выброс, т/год': emissions
             })
@@ -428,6 +546,7 @@ def parse_emissions_xls(uploaded_file):
 
         ws = worksheets[0]
         substances, emissions, codes = [], [], []
+        rate_codes_list, positions_2909 = [], []
 
         for row_elem in ws.findall('.//ss:Row', ns):
             # Восстанавливаем позиции ячеек с учётом ss:Index
@@ -456,21 +575,31 @@ def parse_emissions_xls(uploaded_file):
             except ValueError:
                 continue
 
-            code = extract_code_from_substance(substance)
+            position_2909 = extract_position_from_substance(substance)
+            rate_codes = extract_rate_codes_from_substance(substance)
+            code = rate_codes[0] if rate_codes else None
             substances.append(substance)
             emissions.append(emission)
             codes.append(code)
+            rate_codes_list.append(rate_codes)
+            positions_2909.append(position_2909)
 
         if substances:
-            st.info(f"Файл загружен. Найдено строк с данными: {len(substances)}")
             return pd.DataFrame({
+                'Позиция 2909-р': positions_2909,
                 'Код вещества': codes,
+                'Коды ставок': rate_codes_list,
                 'Наименование вещества': substances,
                 'Валовый выброс, т/год': emissions
             })
         else:
-            st.warning("Не удалось найти данные в XLS-файле. Проверьте формат.")
-            return None
+            return pd.DataFrame(columns=[
+                'Позиция 2909-р',
+                'Код вещества',
+                'Коды ставок',
+                'Наименование вещества',
+                'Валовый выброс, т/год'
+            ])
 
     except Exception as e:
         st.error(f"Ошибка при чтении XLS-файла: {str(e)}")
@@ -481,10 +610,16 @@ def format_dataframe_for_display(df):
     """Форматирует DataFrame для отображения с округлением"""
     display_df = df.copy()
     
-    # Округляем значения
-    display_df['Валовый выброс, т/год'] = display_df['Валовый выброс, т/год'].round(6)
-    display_df['Ставка платы, руб.'] = display_df['Ставка платы, руб.'].round(2)
-    display_df['Сумма платы, руб/год'] = display_df['Сумма платы, руб/год'].round(2)
+    # None для ненайденных ставок преобразуется в NaN перед округлением.
+    display_df['Валовый выброс, т/год'] = pd.to_numeric(
+        display_df['Валовый выброс, т/год'], errors='coerce'
+    ).round(6)
+    display_df['Ставка платы, руб.'] = pd.to_numeric(
+        display_df['Ставка платы, руб.'], errors='coerce'
+    ).round(2)
+    display_df['Сумма платы, руб/год'] = pd.to_numeric(
+        display_df['Сумма платы, руб/год'], errors='coerce'
+    ).round(2)
 
     display_df.index = range(1, len(display_df) + 1)
     return display_df
@@ -500,10 +635,22 @@ def add_total_row(df):
     return pd.concat([df, total_row], ignore_index=True)
 
 # Загрузка файла с выбросами
+st.markdown(
+    """
+    <div class="eco-important-notice">
+      <span class="eco-important-icon" aria-hidden="true">!</span>
+      <div><strong>ВАЖНО</strong><br>
+      <strong>Загрузите файл с нормативами выбросов</strong> из программы ПДВ-Эколог
+      (сохранив его <strong>без изменений</strong> как Файл MS Excel (*.xls)).
+      Не двигайте столбцы, не удаляйте строки в нем.</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 emissions_file = st.file_uploader(
-    "Файл с нормативами выбросов (формат ПДВ)",
-    type=['xls', 'csv', 'txt'],
-    help="Загрузите исходный XLS-файл ПДВ без изменений либо CSV/TXT с разделителем «;»."
+    "Загрузите исходный файл ПДВ в формате .xls",
+    type=['xls'],
+    help="Загрузите исходный файл ПДВ в формате .xls без изменений."
 )
 
 # Настройка коэффициентов в сайдбаре
@@ -512,7 +659,7 @@ with st.sidebar:
         """
         <div class="eco-sidebar-brand">
           <div class="eco-logo" aria-hidden="true"><span></span></div>
-          <div><strong>Ecolytica</strong><small>Калькулятор НВОС</small></div>
+          <div><strong>Ecolytica</strong></div>
         </div>
         <div class="eco-section-label eco-sidebar-label">Параметры</div>
         """,
@@ -565,32 +712,33 @@ with st.sidebar:
 # Основная логика расчета
 if emissions_file is not None:
     with st.spinner('Обработка файла с выбросами...'):
-        # Выбираем парсер по расширению файла
-        fname = emissions_file.name.lower()
-        if fname.endswith('.xls'):
-            df_result = parse_emissions_xls(emissions_file)
-        else:
-            df_result = parse_emissions_file(emissions_file)
+        df_result = parse_emissions_xls(emissions_file)
         
         if df_result is not None and not df_result.empty:
             
             # Добавляем расчет платы
             payments = []
             rates_used = []
+            ambiguous_positions = []
             
             for idx, row in df_result.iterrows():
-                code = row['Код вещества']
+                rate_codes = row['Коды ставок']
                 emission = row['Валовый выброс, т/год']
-                
-                # Ищем ставку по коду
-                rate = find_rate_by_code(code, selected_rates)
+
+                rate = find_rate_by_codes(rate_codes, selected_rates)
+                if len(rate_codes) > 1 and rate is None:
+                    ambiguous_positions.append(row['Позиция 2909-р'])
                 
                 payment = calculate_payment(emission, rate, kvr, kpr)
                 payments.append(payment)
                 rates_used.append(rate)
             
-            df_result['Ставка платы, руб.'] = rates_used
-            df_result['Сумма платы, руб/год'] = payments
+            df_result['Ставка платы, руб.'] = pd.to_numeric(
+                pd.Series(rates_used, index=df_result.index), errors='coerce'
+            )
+            df_result['Сумма платы, руб/год'] = pd.to_numeric(
+                pd.Series(payments, index=df_result.index), errors='coerce'
+            )
             
             # Считаем итоги
             total_payment = df_result['Сумма платы, руб/год'].sum(skipna=True)
@@ -598,6 +746,13 @@ if emissions_file is not None:
             substances_with_rate = df_result['Ставка платы, руб.'].notna().sum()
             
             st.success(f"Обработка завершена: найдено записей — {len(df_result)}")
+            if ambiguous_positions:
+                positions_text = ", ".join(sorted(set(ambiguous_positions), key=int))
+                st.warning(
+                    "Не удалось однозначно определить ставку для "
+                    f"позиций № 2909-р: {positions_text}. "
+                    "Связанные коды ставок отсутствуют или имеют разные значения."
+                )
             
             # Отображаем итоговую сумму
             st.markdown('<div class="eco-section-label eco-results-label">Результаты расчёта</div>', unsafe_allow_html=True)
@@ -627,7 +782,18 @@ if emissions_file is not None:
             st.dataframe(
                 display_df,
                 use_container_width=True,
-                height=600
+                height=600,
+                column_config={
+                    'Валовый выброс, т/год': st.column_config.NumberColumn(
+                        format='%.6f'
+                    ),
+                    'Ставка платы, руб.': st.column_config.NumberColumn(
+                        format='%.2f'
+                    ),
+                    'Сумма платы, руб/год': st.column_config.NumberColumn(
+                        format='%.2f'
+                    ),
+                },
             )
             
             # НОВЫЙ БЛОК: Кнопка для скачивания в формате Excel с итоговой строкой
@@ -637,13 +803,9 @@ if emissions_file is not None:
             export_df = df_result[['Наименование вещества', 'Валовый выброс, т/год',
                                    'Ставка платы, руб.', 'Сумма платы, руб/год']].copy()
             
-            # Округляем значения
-            export_df['Валовый выброс, т/год'] = export_df['Валовый выброс, т/год'].round(6)
-            export_df['Ставка платы, руб.'] = export_df['Ставка платы, руб.'].round(2)
-            export_df['Сумма платы, руб/год'] = export_df['Сумма платы, руб/год'].round(2)
-            
-            # Добавляем итоговую строку
+            # Сначала считаем итоги по исходным значениям, затем округляем вывод.
             export_df_with_total = add_total_row(export_df)
+            export_df_with_total = format_dataframe_for_display(export_df_with_total)
             
             # Создаем Excel файл в памяти
             output = io.BytesIO()
@@ -653,11 +815,19 @@ if emissions_file is not None:
                     writer,
                     sheet_name='Расчет платы',
                     index=False,
-                    float_format='%.6f'
                 )
                 
-                # Настраиваем ширину колонок
+                # Настраиваем числовые форматы и ширину колонок
                 worksheet = writer.sheets['Расчет платы']
+                number_formats = {
+                    2: '0.000000',
+                    3: '0.00',
+                    4: '0.00',
+                }
+                for column_index, number_format in number_formats.items():
+                    for row_index in range(2, len(export_df_with_total) + 2):
+                        cell = worksheet.cell(row=row_index, column=column_index)
+                        cell.number_format = number_format
                 for column in worksheet.columns:
                     max_length = 0
                     column_letter = column[0].column_letter
@@ -693,7 +863,11 @@ if emissions_file is not None:
             )
                 
         else:
-            st.error("Не удалось извлечь данные из файла. Проверьте, что файл имеет правильный формат.")
+            if df_result is not None and df_result.empty:
+                st.error(
+                    "Данных не найдено, либо загруженный файл сохранен с изменениями. "
+                    "Повторно выгрузите файл из программы ПДВ и сохраните его без изменений."
+                )
 
 # Инструкция в сайдбаре
 with st.sidebar:
