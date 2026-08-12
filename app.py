@@ -642,7 +642,9 @@ st.markdown(
       <div><strong>ВАЖНО</strong><br>
       <strong>Загрузите файл с нормативами выбросов</strong> из программы ПДВ-Эколог
       (сохранив его <strong>без изменений</strong> как Файл MS Excel (*.xls)).
-      Не двигайте столбцы, не удаляйте строки в нем.</div>
+      Не двигайте столбцы, не удаляйте строки в нем.
+      <div class="eco-privacy-note">Загруженный файл используется только для расчета и не сохраняется.</div>
+      </div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -660,6 +662,15 @@ with st.sidebar:
         <div class="eco-sidebar-brand">
           <div class="eco-logo" aria-hidden="true"><span></span></div>
           <div><strong>Ecolytica</strong></div>
+        </div>
+        <div class="eco-sidebar-about">
+          <p>Эколог-проектировщик слишком много времени тратит на ручной поиск данных,
+          сверку таблиц и пересчет показателей.</p>
+          <p>Этот инструмент — помогает убрать ручную рутину из работы эколога.</p>
+          <div class="eco-sidebar-links">
+            <a href="https://t.me/ecology_start" target="_blank" rel="noopener noreferrer"><strong>Telegram:</strong> Только без рук</a>
+            <a href="https://vk.ru/ecolytica" target="_blank" rel="noopener noreferrer"><strong>ВК:</strong> Экология без ручной рутины | Ecolytica</a>
+          </div>
         </div>
         <div class="eco-section-label eco-sidebar-label">Параметры</div>
         """,
@@ -760,7 +771,7 @@ if emissions_file is not None:
             with col1:
                 st.metric(
                     "Итого плата",
-                    f"{total_payment:,.2f} руб" if pd.notna(total_payment) else "0 руб"
+                    f"{total_payment:.2f} руб" if pd.notna(total_payment) else "0 руб"
                 )
             with col2:
                 st.metric("Всего веществ", len(df_result))
@@ -795,6 +806,29 @@ if emissions_file is not None:
                     ),
                 },
             )
+
+            st.markdown(
+                """
+                <div class="eco-social-cta">
+                  Если инструмент сэкономил вам время — подпишитесь на мой канал <strong>ВК или Telegram</strong>.
+                  <p>Там показываю, как упростить жизнь экологу-проектировщику.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            telegram_col, vk_col = st.columns(2)
+            with telegram_col:
+                st.link_button(
+                    "Подписаться в Telegram",
+                    "https://t.me/ecology_start",
+                    use_container_width=True,
+                )
+            with vk_col:
+                st.link_button(
+                    "Вступить в ВК",
+                    "https://vk.ru/ecolytica",
+                    use_container_width=True,
+                )
             
             # НОВЫЙ БЛОК: Кнопка для скачивания в формате Excel с итоговой строкой
             st.subheader("Экспорт результатов")
@@ -890,3 +924,11 @@ with st.sidebar:
     
        """)
 
+st.markdown('<div class="eco-feedback-label">Обратная связь</div>', unsafe_allow_html=True)
+with st.expander("Сообщить об ошибке / предложить улучшение"):
+    st.markdown("Напишите мне на почту: **fedor.belyanin@gmail.com**")
+
+st.markdown(
+    '<footer class="eco-footer">Проект <strong>«Экология без ручной рутины | Ecolytica»</strong></footer>',
+    unsafe_allow_html=True,
+)
