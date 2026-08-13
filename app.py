@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import numpy as np
+import xlrd
 
 from analytics import (
     flush_events,
@@ -572,6 +573,8 @@ SOURCE_FORMAT_TITLE = (
 )
 
 
+BINARY_XLS_SIGNATURE = bytes.fromhex('D0 CF 11 E0 A1 B1 1A E1')
+
 def _normalize_xls_text(value):
     """Нормализует текст SpreadsheetML для устойчивого поиска заголовков."""
     return ' '.join(str(value or '').split()).strip()
@@ -594,6 +597,23 @@ def _spreadsheetml_rows(worksheet, namespace):
         rows.append(row_dict)
     return rows
 
+
+def _binary_xls_rows(raw_content):
+    """Читает первый лист бинарного Excel 97–2003 из памяти."""
+    workbook = xlrd.open_workbook(file_contents=raw_content)
+    if workbook.nsheets == 0:
+        return []
+
+    worksheet = workbook.sheet_by_index(0)
+    rows = []
+    for row_idx in range(worksheet.nrows):
+        row_dict = {}
+        for col_idx in range(worksheet.ncols):
+            cell = worksheet.cell(row_idx, col_idx)
+            if cell.ctype != xlrd.XL_CELL_EMPTY:
+                row_dict[col_idx + 1] = cell.value
+        rows.append(row_dict)
+    return rows
 
 def _detect_emissions_xls_format(rows):
     """Определяет вариант выгрузки ПДВ-Эколог по внутреннему заголовку."""
@@ -643,7 +663,12 @@ def _parse_object_format_rows(rows):
     """Разбирает сводную таблицу нормативов по объекту ОНВ."""
     records = []
     for row in rows:
-        if not _normalize_xls_text(row.get(1)).isdigit():
+        row_number = row.get(1)
+        is_number = (
+            isinstance(row_number, (int, float))
+            and float(row_number).is_integer()
+        )
+        if not is_number and not _normalize_xls_text(row_number).isdigit():
             continue
         substance = _normalize_xls_text(row.get(2))
         if len(substance) < 4:
@@ -683,29 +708,31 @@ def _parse_source_format_rows(rows):
 
 
 def parse_emissions_xls(uploaded_file):
-    """Парсит два варианта XLS-файлов SpreadsheetML из ПДВ-Эколог."""
+    """Парсит XML и бинарные XLS-файлы из ПДВ-Эколог."""
     try:
         raw_content = uploaded_file.read()
-        content = raw_content.decode('utf-8-sig')
-    except (OSError, UnicodeError) as exc:
+    except OSError:
         return XlsParseResult(
             None,
             'read_error',
-            f"Ошибка при чтении XLS-файла: {exc}",
+            "Не удалось прочитать XLS-файл. Повторно выгрузите его из ПДВ-Эколог.",
         )
 
-    try:
-        tree = ET.fromstring(content)
-    except ET.ParseError as exc:
-        return XlsParseResult(
-            None,
-            'invalid_xml',
-            f"Ошибка XML-разбора XLS-файла: {exc}",
-        )
+    stripped_content = raw_content.lstrip()
+    if stripped_content.startswith(b'<?xml') or stripped_content.startswith(b'<Workbook'):
+        try:
+            content = raw_content.decode('utf-8-sig')
+            tree = ET.fromstring(content)
+        except (UnicodeError, ET.ParseError):
+            return XlsParseResult(
+                None,
+                'invalid_xml',
+                "Не удалось прочитать XML-структуру XLS-файла. "
+                "Повторно выгрузите файл из ПДВ-Эколог без изменений.",
+            )
 
-    try:
-        SS_NS = 'urn:schemas-microsoft-com:office:spreadsheet'
-        ns = {'ss': SS_NS}
+        ss_ns = 'urn:schemas-microsoft-com:office:spreadsheet'
+        ns = {'ss': ss_ns}
         worksheets = tree.findall('.//ss:Worksheet', ns)
         if not worksheets:
             return XlsParseResult(
@@ -713,8 +740,32 @@ def parse_emissions_xls(uploaded_file):
                 'no_worksheets',
                 "В XLS-файле не найдено листов.",
             )
-
         rows = _spreadsheetml_rows(worksheets[0], ns)
+    elif raw_content.startswith(BINARY_XLS_SIGNATURE):
+        try:
+            rows = _binary_xls_rows(raw_content)
+        except Exception:
+            return XlsParseResult(
+                None,
+                'invalid_binary_xls',
+                "Не удалось прочитать бинарный XLS-файл. "
+                "Повторно выгрузите файл из ПДВ-Эколог без изменений.",
+            )
+        if not rows:
+            return XlsParseResult(
+                None,
+                'no_worksheets',
+                "В XLS-файле не найдено листов.",
+            )
+    else:
+        return XlsParseResult(
+            None,
+            'unsupported_format',
+            "Файл не является поддерживаемым XLS. Загрузите исходную выгрузку "
+            "из ПДВ-Эколог без изменения формата.",
+        )
+
+    try:
         xls_format = _detect_emissions_xls_format(rows)
         if xls_format == 'object':
             records = _parse_object_format_rows(rows)
@@ -731,11 +782,12 @@ def parse_emissions_xls(uploaded_file):
         if not records:
             return XlsParseResult(_empty_emissions_dataframe(), 'no_data')
         return XlsParseResult(_build_emissions_dataframe(records))
-    except Exception as exc:
+    except Exception:
         return XlsParseResult(
             None,
             'unexpected_error',
-            f"Ошибка при чтении XLS-файла: {exc}",
+            "Не удалось обработать данные XLS-файла. "
+            "Повторно выгрузите файл из ПДВ-Эколог без изменений.",
         )
 
 def format_dataframe_for_display(df):
@@ -788,6 +840,10 @@ st.markdown(
       <strong>Нормативы по стационарным источникам выбросов</strong> из ПДВ-Эколог
       (сохранив его <strong>без изменений</strong> как Файл MS Excel (*.xls)).
       Не двигайте столбцы, не удаляйте строки в нем.
+      <div class="eco-supported-formats"><strong>Поддерживаемые форматы:</strong><br>
+      <span class="eco-format-icon eco-format-ok" aria-hidden="true">✓</span> Документ Excel (XML)<br>
+      <span class="eco-format-icon eco-format-ok" aria-hidden="true">✓</span> Документ Excel 97/2000/XP<br>
+      <span class="eco-format-icon eco-format-no" aria-hidden="true">×</span> Excel (OLE) / PDF / Word / HTML — пока не поддерживаются</div>
       <div class="eco-privacy-note">Загруженный файл используется только для расчета и не сохраняется.<br>
       Для анализа использования применяется Google Analytics. Имена и содержимое файлов,
       данные расчёта и суммы в аналитику не передаются.</div>

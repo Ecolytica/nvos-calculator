@@ -82,3 +82,84 @@ def test_rejects_unknown_spreadsheetml_format():
     assert not result.success
     assert result.error_category == "unsupported_format"
     assert "Не удалось определить вид таблицы" in result.user_message
+
+class _FakeCell:
+    def __init__(self, value):
+        self.value = value
+        self.ctype = app.xlrd.XL_CELL_EMPTY if value is None else app.xlrd.XL_CELL_TEXT
+
+
+class _FakeSheet:
+    def __init__(self, rows):
+        self._rows = rows
+        self.nrows = len(rows)
+        self.ncols = max(len(row) for row in rows)
+
+    def cell(self, row_idx, col_idx):
+        value = self._rows[row_idx][col_idx] if col_idx < len(self._rows[row_idx]) else None
+        return _FakeCell(value)
+
+
+class _FakeWorkbook:
+    def __init__(self, rows):
+        self.nsheets = 1
+        self._sheet = _FakeSheet(rows)
+
+    def sheet_by_index(self, index):
+        assert index == 0
+        return self._sheet
+
+
+def test_routes_binary_xls_to_common_object_parser(monkeypatch):
+    title = (
+        "Нормативы выбросов загрязняющих веществ от стационарных ИЗАВ "
+        "в атмосферный воздух по объекту ОНВ."
+    )
+    rows = [
+        [None, title],
+        [1.0, "0155 Натрия карбонат", None, None, None, 0.000036],
+        [2.0, "0301 Азота диоксид", None, None, None, 8.369627],
+    ]
+    monkeypatch.setattr(
+        app.xlrd,
+        "open_workbook",
+        lambda **kwargs: _FakeWorkbook(rows),
+    )
+    uploaded = io.BytesIO(app.BINARY_XLS_SIGNATURE + b"binary payload")
+
+    result = app.parse_emissions_xls(uploaded)
+
+    assert result.success
+    assert result.dataframe["Код вещества"].tolist() == ["0155", "0301"]
+    assert result.dataframe["Валовый выброс, т/год"].tolist() == pytest.approx(
+        [0.000036, 8.369627]
+    )
+
+
+def test_reports_damaged_binary_xls(monkeypatch):
+    def raise_xlrd_error(**kwargs):
+        raise app.xlrd.XLRDError("damaged")
+
+    monkeypatch.setattr(app.xlrd, "open_workbook", raise_xlrd_error)
+    result = app.parse_emissions_xls(
+        io.BytesIO(app.BINARY_XLS_SIGNATURE + b"damaged")
+    )
+
+    assert not result.success
+    assert result.error_category == "invalid_binary_xls"
+    assert "codec" not in result.user_message.lower()
+
+
+def test_rejects_unknown_file_container():
+    result = app.parse_emissions_xls(io.BytesIO(b"not an xls file"))
+
+    assert not result.success
+    assert result.error_category == "unsupported_format"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("0,000036", 0.000036), ("8.369627", 8.369627), ("3,60e-05", 0.000036)],
+)
+def test_parses_supported_xls_number_formats(value, expected):
+    assert app._parse_xls_number(value) == pytest.approx(expected)
