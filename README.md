@@ -41,13 +41,13 @@ streamlit run app.py
 
 ## Аналитика
 
-Необязательная обезличенная аналитика работает через Google Analytics 4. Measurement ID задаётся только в секретах Streamlit:
+Необязательная обезличенная аналитика работает через Google Analytics 4 с Measurement ID `G-KBKGG5TXDT`. При необходимости его можно переопределить в секретах Streamlit:
 
 ```toml
-GA4_MEASUREMENT_ID = "G-XXXXXXXXXX"
+GA4_MEASUREMENT_ID = "G-KBKGG5TXDT"
 ```
 
-Без этого секрета приложение работает штатно, но события не отправляются. В GA4 используются события `page_view`, `file_uploaded`, `xls_parse_success`, `xls_parse_failed`, `excel_download`, `social_click` и `feedback_open`. Имена и содержимое файлов, данные расчёта и суммы не передаются.
+Если секрет не задан, используется встроенный идентификатор потока данных. В GA4 используются события `page_view`, `file_uploaded`, `xls_parse_success`, `xls_parse_failed`, `excel_download`, `social_click` и `feedback_open`. Имена и содержимое файлов, данные расчёта и суммы не передаются.
 
 Для параметров `network`, `source` и `error_category` в GA4 нужно создать специальные параметры с областью действия «Событие».
 

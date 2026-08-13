@@ -11,15 +11,18 @@ import streamlit as st
 from streamlit.components.v1 import html as component_html
 
 _GA4_ID_PATTERN = re.compile(r"^G-[A-Z0-9]+$")
+_DEFAULT_GA4_MEASUREMENT_ID = "G-KBKGG5TXDT"
 _APP_URL = "https://ecolytica-nvos.streamlit.app/"
 
 
 def get_measurement_id() -> str | None:
     """Возвращает валидный GA4 Measurement ID или отключает аналитику."""
     try:
-        value = str(st.secrets.get("GA4_MEASUREMENT_ID", "")).strip().upper()
+        value = str(
+            st.secrets.get("GA4_MEASUREMENT_ID", _DEFAULT_GA4_MEASUREMENT_ID)
+        ).strip().upper()
     except Exception:
-        return None
+        value = _DEFAULT_GA4_MEASUREMENT_ID
     return value if _GA4_ID_PATTERN.fullmatch(value) else None
 
 
