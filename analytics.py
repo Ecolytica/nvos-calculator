@@ -61,17 +61,30 @@ def queue_event(event_name: str, **params: Any) -> None:
 def render_page_view() -> None:
     """Регистрирует одно открытие на Streamlit-сессию, а не на каждый rerun."""
     measurement_id = get_measurement_id()
-    if not measurement_id or st.session_state.get("_ga4_page_view_sent"):
+    if not measurement_id:
         return
+    should_send = not st.session_state.get("_ga4_page_view_sent")
     st.session_state["_ga4_page_view_sent"] = True
-    _render_event(
-        "page_view",
-        {
-            "page_location": _APP_URL,
-            "page_title": "Калькулятор платы за выбросы в атмосферу",
-        },
-        measurement_id,
-    )
+
+    # Keep this component at the same Streamlit delta path on every rerun. If
+    # it disappears, Streamlit removes the iframe and may abort gtag.js before
+    # its queued page_view has been transmitted.
+    if should_send:
+        _render_event(
+            "page_view",
+            {
+                "page_location": _APP_URL,
+                "page_title": "Калькулятор платы за выбросы в атмосферу",
+            },
+            measurement_id,
+        )
+    else:
+        component_html(
+            f'<!doctype html><html><head><meta charset="utf-8">'
+            f'{_gtag_bootstrap(measurement_id)}</head><body></body></html>',
+            height=1,
+            scrolling=False,
+        )
 
 
 def _render_event(event_name: str, params: dict[str, Any], measurement_id: str, token: int = 0) -> None:
@@ -84,7 +97,8 @@ def _render_event(event_name: str, params: dict[str, Any], measurement_id: str, 
 gtag('event', {event_json}, Object.assign({{}}, {params_json}, {{transport_type: 'beacon'}}));
 </script></body></html>
 """
-    component_html(markup, height=0, scrolling=False)
+    # Keep the analytics iframe renderable while remaining visually hidden.
+    component_html(markup, height=1, scrolling=False)
 
 
 def flush_events() -> None:
