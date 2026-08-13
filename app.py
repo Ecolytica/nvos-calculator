@@ -562,11 +562,128 @@ def _empty_emissions_dataframe():
     ])
 
 
+OBJECT_FORMAT_TITLE = (
+    'нормативы выбросов загрязняющих веществ от стационарных изав '
+    'в атмосферный воздух по объекту онв'
+)
+SOURCE_FORMAT_TITLE = (
+    'нормативы выбросов загрязняющих веществ в атмосферный воздух '
+    'по конкретным стационарным источникам выбросов и загрязняющим веществам'
+)
+
+
+def _normalize_xls_text(value):
+    """Нормализует текст SpreadsheetML для устойчивого поиска заголовков."""
+    return ' '.join(str(value or '').split()).strip()
+
+
+def _spreadsheetml_rows(worksheet, namespace):
+    """Возвращает строки SpreadsheetML с учетом разреженных индексов ячеек."""
+    rows = []
+    ss_ns = 'urn:schemas-microsoft-com:office:spreadsheet'
+    for row_elem in worksheet.findall('.//ss:Row', namespace):
+        row_dict = {}
+        col_idx = 1
+        for cell in row_elem.findall('ss:Cell', namespace):
+            explicit = cell.get(f'{{{ss_ns}}}Index')
+            if explicit:
+                col_idx = int(explicit)
+            data_elem = cell.find('ss:Data', namespace)
+            row_dict[col_idx] = data_elem.text if data_elem is not None else None
+            col_idx += 1
+        rows.append(row_dict)
+    return rows
+
+
+def _detect_emissions_xls_format(rows):
+    """Определяет вариант выгрузки ПДВ-Эколог по внутреннему заголовку."""
+    workbook_text = ' '.join(
+        _normalize_xls_text(value).lower()
+        for row in rows
+        for value in row.values()
+        if value
+    )
+    if SOURCE_FORMAT_TITLE in workbook_text:
+        return 'sources'
+    if OBJECT_FORMAT_TITLE in workbook_text:
+        return 'object'
+    return None
+
+
+def _parse_xls_number(value):
+    normalized = _normalize_xls_text(value).replace(' ', '').replace(',', '.')
+    return float(normalized)
+
+
+def _build_emissions_dataframe(records):
+    if not records:
+        return _empty_emissions_dataframe()
+
+    substances, emissions, codes = [], [], []
+    rate_codes_list, positions_2909 = [], []
+    for substance, emission in records:
+        position_2909 = extract_position_from_substance(substance)
+        rate_codes = extract_rate_codes_from_substance(substance)
+        substances.append(substance)
+        emissions.append(emission)
+        codes.append(rate_codes[0] if rate_codes else None)
+        rate_codes_list.append(rate_codes)
+        positions_2909.append(position_2909)
+
+    return pd.DataFrame({
+        'Позиция 2909-р': positions_2909,
+        'Код вещества': codes,
+        'Коды ставок': rate_codes_list,
+        'Наименование вещества': substances,
+        'Валовый выброс, т/год': emissions,
+    })
+
+
+def _parse_object_format_rows(rows):
+    """Разбирает сводную таблицу нормативов по объекту ОНВ."""
+    records = []
+    for row in rows:
+        if not _normalize_xls_text(row.get(1)).isdigit():
+            continue
+        substance = _normalize_xls_text(row.get(2))
+        if len(substance) < 4:
+            continue
+        try:
+            emission = _parse_xls_number(row.get(6))
+        except (TypeError, ValueError):
+            continue
+        records.append((substance, emission))
+    return records
+
+
+def _parse_source_format_rows(rows):
+    """Разбирает таблицу по источникам, используя только строки «Всего по ЗВ»."""
+    records = []
+    current_substance = None
+    substance_heading = 'наименование и код загрязняющего вещества'
+
+    for row in rows:
+        first_cell = _normalize_xls_text(row.get(1)).lower()
+        if substance_heading in first_cell:
+            substance = _normalize_xls_text(row.get(5))
+            current_substance = substance if len(substance) >= 4 else None
+            continue
+
+        total_label = _normalize_xls_text(row.get(2)).lower()
+        if current_substance and total_label == 'всего по зв':
+            try:
+                emission = _parse_xls_number(row.get(5))
+            except (TypeError, ValueError):
+                current_substance = None
+                continue
+            records.append((current_substance, emission))
+            current_substance = None
+
+    return records
+
+
 def parse_emissions_xls(uploaded_file):
-    """
-    Парсит XLS-файл формата SpreadsheetML и возвращает безопасный статус.
-    Колонка 1 — номер строки, колонка 2 — наименование вещества, колонка 6 — т/год.
-    """
+    """Парсит два варианта XLS-файлов SpreadsheetML из ПДВ-Эколог."""
     try:
         raw_content = uploaded_file.read()
         content = raw_content.decode('utf-8-sig')
@@ -597,61 +714,29 @@ def parse_emissions_xls(uploaded_file):
                 "В XLS-файле не найдено листов.",
             )
 
-        ws = worksheets[0]
-        substances, emissions, codes = [], [], []
-        rate_codes_list, positions_2909 = [], []
+        rows = _spreadsheetml_rows(worksheets[0], ns)
+        xls_format = _detect_emissions_xls_format(rows)
+        if xls_format == 'object':
+            records = _parse_object_format_rows(rows)
+        elif xls_format == 'sources':
+            records = _parse_source_format_rows(rows)
+        else:
+            return XlsParseResult(
+                None,
+                'unsupported_format',
+                'Не удалось определить вид таблицы. Загрузите исходную выгрузку '
+                'нормативов по объекту ОНВ или по конкретным стационарным источникам.',
+            )
 
-        for row_elem in ws.findall('.//ss:Row', ns):
-            row_dict = {}
-            col_idx = 1
-            for cell in row_elem.findall('ss:Cell', ns):
-                explicit = cell.get(f'{{{SS_NS}}}Index')
-                if explicit:
-                    col_idx = int(explicit)
-                data_elem = cell.find('ss:Data', ns)
-                row_dict[col_idx] = data_elem.text if data_elem is not None else None
-                col_idx += 1
-
-            col1 = str(row_dict.get(1, '') or '').strip()
-            if not col1.isdigit():
-                continue
-
-            substance = str(row_dict.get(2, '') or '').strip()
-            if len(substance) < 4:
-                continue
-
-            emission_str = str(row_dict.get(6, '') or '').strip().replace(',', '.').replace(' ', '')
-            try:
-                emission = float(emission_str)
-            except ValueError:
-                continue
-
-            position_2909 = extract_position_from_substance(substance)
-            rate_codes = extract_rate_codes_from_substance(substance)
-            code = rate_codes[0] if rate_codes else None
-            substances.append(substance)
-            emissions.append(emission)
-            codes.append(code)
-            rate_codes_list.append(rate_codes)
-            positions_2909.append(position_2909)
-
-        if not substances:
+        if not records:
             return XlsParseResult(_empty_emissions_dataframe(), 'no_data')
-
-        return XlsParseResult(pd.DataFrame({
-            'Позиция 2909-р': positions_2909,
-            'Код вещества': codes,
-            'Коды ставок': rate_codes_list,
-            'Наименование вещества': substances,
-            'Валовый выброс, т/год': emissions,
-        }))
+        return XlsParseResult(_build_emissions_dataframe(records))
     except Exception as exc:
         return XlsParseResult(
             None,
             'unexpected_error',
             f"Ошибка при чтении XLS-файла: {exc}",
         )
-
 
 def format_dataframe_for_display(df):
     """Форматирует DataFrame для отображения с округлением"""
@@ -699,7 +784,8 @@ st.markdown(
     <div class="eco-important-notice">
       <span class="eco-important-icon" aria-hidden="true">!</span>
       <div><strong>ВАЖНО</strong><br>
-      <strong>Загрузите файл с</strong> таблицей <strong>нормативов выбросов по объекту ОНВ в целом</strong> из ПДВ-Эколог
+      <strong>Загрузите файл с</strong> таблицей <strong>нормативов выбросов по объекту ОНВ в целом</strong> или
+      <strong>Нормативы по стационарным источникам выбросов</strong> из ПДВ-Эколог
       (сохранив его <strong>без изменений</strong> как Файл MS Excel (*.xls)).
       Не двигайте столбцы, не удаляйте строки в нем.
       <div class="eco-privacy-note">Загруженный файл используется только для расчета и не сохраняется.<br>
