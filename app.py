@@ -699,7 +699,7 @@ st.markdown(
     <div class="eco-important-notice">
       <span class="eco-important-icon" aria-hidden="true">!</span>
       <div><strong>ВАЖНО</strong><br>
-      <strong>Загрузите файл с нормативами выбросов</strong> из программы ПДВ-Эколог
+      <strong>Загрузите файл с</strong> таблицей <strong>нормативов выбросов по объекту ОНВ в целом</strong> из ПДВ-Эколог
       (сохранив его <strong>без изменений</strong> как Файл MS Excel (*.xls)).
       Не двигайте столбцы, не удаляйте строки в нем.
       <div class="eco-privacy-note">Загруженный файл используется только для расчета и не сохраняется.<br>
