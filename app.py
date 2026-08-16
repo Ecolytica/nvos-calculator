@@ -446,11 +446,15 @@ def extract_code_from_substance(substance):
 
 def calculate_payment(emission, rate, kvr, kpr):
     """Рассчитывает плату за выбросы с учетом коэффициентов Квр и Кпр"""
+    if emission is None or pd.isna(emission):
+        return None
     if rate is None or pd.isna(rate):
         return None
-    
-    # Расчет с учетом коэффициентов Квр и Кпр
-    return emission * rate * kvr * kpr
+
+    try:
+        return float(emission) * float(rate) * kvr * kpr
+    except (TypeError, ValueError):
+        return None
 
 def parse_emissions_file(uploaded_file):
     """
@@ -547,6 +551,8 @@ class XlsParseResult:
     dataframe: pd.DataFrame | None
     error_category: str | None = None
     user_message: str | None = None
+    years: tuple[int, ...] = ()
+    warnings: tuple[str, ...] = ()
 
     @property
     def success(self):
@@ -560,6 +566,7 @@ def _empty_emissions_dataframe():
         'Коды ставок',
         'Наименование вещества',
         'Валовый выброс, т/год',
+        'Нормативы по годам',
     ])
 
 
@@ -574,6 +581,16 @@ SOURCE_FORMAT_TITLE = (
 
 
 BINARY_XLS_SIGNATURE = bytes.fromhex('D0 CF 11 E0 A1 B1 1A E1')
+ANNUAL_PERIOD_LENGTH = 8
+MODIFIED_STRUCTURE_MESSAGE = (
+    'Файл не соответствует ожидаемой структуре. Вероятно, столбцы были '
+    'перемещены или удалены. Загрузите исходный файл из ПДВ-Эколог без изменений.'
+)
+
+
+class XlsStructureError(ValueError):
+    """Структура выгрузки отличается от поддерживаемого шаблона."""
+
 
 def _normalize_xls_text(value):
     """Нормализует текст SpreadsheetML для устойчивого поиска заголовков."""
@@ -635,20 +652,102 @@ def _parse_xls_number(value):
     return float(normalized)
 
 
-def _build_emissions_dataframe(records):
+def _detect_annual_layout(rows, xls_format):
+    """Проверяет позиции и состав всех восьмилетних блоков."""
+    first_header_column = 5 if xls_format == 'object' else 4
+    expected_header_columns = tuple(
+        first_header_column + offset * 3
+        for offset in range(ANNUAL_PERIOD_LENGTH)
+    )
+    detected_years = None
+    header_rows_found = 0
+
+    for row_index, row in enumerate(rows):
+        year_cells = []
+        for column_index, value in row.items():
+            match = re.search(
+                r'(?<!\d)(20\d{2})\s*год',
+                _normalize_xls_text(value).lower(),
+            )
+            if match:
+                year_cells.append((int(match.group(1)), column_index))
+        if len(year_cells) < 2:
+            continue
+
+        header_rows_found += 1
+        years_by_column = sorted(
+            (column_index, year)
+            for year, column_index in year_cells
+        )
+        header_columns = tuple(column for column, _year in years_by_column)
+        years = tuple(year for _column, year in years_by_column)
+        expected_years = tuple(range(years[0], years[0] + ANNUAL_PERIOD_LENGTH))
+        if (
+            len(year_cells) != ANNUAL_PERIOD_LENGTH
+            or header_columns != expected_header_columns
+            or years != expected_years
+            or (detected_years is not None and years != detected_years)
+        ):
+            raise XlsStructureError
+
+        if row_index + 1 >= len(rows):
+            raise XlsStructureError
+        units_row = rows[row_index + 1]
+        for header_column in expected_header_columns:
+            units = tuple(
+                _normalize_xls_text(units_row.get(header_column + offset))
+                .lower()
+                .replace(' ', '')
+                for offset in range(3)
+            )
+            if (
+                units[0] != 'г/с'
+                or units[1] not in {'т/г', 'т/год'}
+                or units[2] != 'пдв/врв'
+            ):
+                raise XlsStructureError
+
+        detected_years = years
+
+    if header_rows_found == 0 or detected_years is None:
+        raise XlsStructureError
+
+    tons_columns = {
+        year: header_column + 1
+        for year, header_column in zip(detected_years, expected_header_columns)
+    }
+    return detected_years, tons_columns
+
+def _parse_annual_norms(row, substance, years, tons_columns, warnings):
+    annual_norms = {}
+    for year in years:
+        value = row.get(tons_columns[year])
+        try:
+            annual_norms[year] = _parse_xls_number(value)
+        except (TypeError, ValueError):
+            annual_norms[year] = None
+            warnings.append(
+                f'{substance}: отсутствует или некорректен норматив за {year} год'
+            )
+    return annual_norms
+
+
+def _build_emissions_dataframe(records, years):
     if not records:
         return _empty_emissions_dataframe()
 
     substances, emissions, codes = [], [], []
-    rate_codes_list, positions_2909 = [], []
-    for substance, emission in records:
+    rate_codes_list, positions_2909, annual_values = [], [], []
+    first_year = years[0]
+    for substance, annual_norms in records:
         position_2909 = extract_position_from_substance(substance)
         rate_codes = extract_rate_codes_from_substance(substance)
         substances.append(substance)
-        emissions.append(emission)
+        emissions.append(annual_norms.get(first_year))
         codes.append(rate_codes[0] if rate_codes else None)
         rate_codes_list.append(rate_codes)
         positions_2909.append(position_2909)
+        annual_values.append(annual_norms)
 
     return pd.DataFrame({
         'Позиция 2909-р': positions_2909,
@@ -656,10 +755,11 @@ def _build_emissions_dataframe(records):
         'Коды ставок': rate_codes_list,
         'Наименование вещества': substances,
         'Валовый выброс, т/год': emissions,
+        'Нормативы по годам': annual_values,
     })
 
 
-def _parse_object_format_rows(rows):
+def _parse_object_format_rows(rows, years, tons_columns, warnings):
     """Разбирает сводную таблицу нормативов по объекту ОНВ."""
     records = []
     for row in rows:
@@ -673,37 +773,31 @@ def _parse_object_format_rows(rows):
         substance = _normalize_xls_text(row.get(2))
         if len(substance) < 4:
             continue
-        try:
-            emission = _parse_xls_number(row.get(6))
-        except (TypeError, ValueError):
-            continue
-        records.append((substance, emission))
+        annual_norms = _parse_annual_norms(
+            row, substance, years, tons_columns, warnings
+        )
+        records.append((substance, annual_norms))
     return records
 
 
-def _parse_source_format_rows(rows):
+def _parse_source_format_rows(rows, years, tons_columns, warnings):
     """Разбирает таблицу по источникам, используя только строки «Всего по ЗВ»."""
     records = []
     current_substance = None
     substance_heading = 'наименование и код загрязняющего вещества'
-
     for row in rows:
         first_cell = _normalize_xls_text(row.get(1)).lower()
         if substance_heading in first_cell:
             substance = _normalize_xls_text(row.get(5))
             current_substance = substance if len(substance) >= 4 else None
             continue
-
         total_label = _normalize_xls_text(row.get(2)).lower()
         if current_substance and total_label == 'всего по зв':
-            try:
-                emission = _parse_xls_number(row.get(5))
-            except (TypeError, ValueError):
-                current_substance = None
-                continue
-            records.append((current_substance, emission))
+            annual_norms = _parse_annual_norms(
+                row, current_substance, years, tons_columns, warnings
+            )
+            records.append((current_substance, annual_norms))
             current_substance = None
-
     return records
 
 
@@ -767,10 +861,25 @@ def parse_emissions_xls(uploaded_file):
 
     try:
         xls_format = _detect_emissions_xls_format(rows)
+        warnings = []
+        if xls_format in {'object', 'sources'}:
+            try:
+                years, tons_columns = _detect_annual_layout(rows, xls_format)
+            except XlsStructureError:
+                return XlsParseResult(
+                    None,
+                    'modified_structure',
+                    MODIFIED_STRUCTURE_MESSAGE,
+                )
+
         if xls_format == 'object':
-            records = _parse_object_format_rows(rows)
+            records = _parse_object_format_rows(
+                rows, years, tons_columns, warnings
+            )
         elif xls_format == 'sources':
-            records = _parse_source_format_rows(rows)
+            records = _parse_source_format_rows(
+                rows, years, tons_columns, warnings
+            )
         else:
             return XlsParseResult(
                 None,
@@ -781,7 +890,11 @@ def parse_emissions_xls(uploaded_file):
 
         if not records:
             return XlsParseResult(_empty_emissions_dataframe(), 'no_data')
-        return XlsParseResult(_build_emissions_dataframe(records))
+        return XlsParseResult(
+            _build_emissions_dataframe(records, years),
+            years=years,
+            warnings=tuple(warnings),
+        )
     except Exception:
         return XlsParseResult(
             None,
@@ -817,6 +930,154 @@ def add_total_row(df):
         'Сумма платы, руб/год': [df['Сумма платы, руб/год'].sum()]
     })
     return pd.concat([df, total_row], ignore_index=True)
+
+def build_yearly_export_dataframe(df, years, kvr, kpr):
+    """Формирует матрицу «норматив — сумма платы» для восьми лет."""
+    export_data = {
+        'Наименование вещества': df['Наименование вещества'].tolist(),
+        'Ставка платы, руб.': pd.to_numeric(
+            df['Ставка платы, руб.'], errors='coerce'
+        ).tolist(),
+    }
+
+    for year in years:
+        norms = pd.Series(
+            [
+                annual_norms.get(year)
+                if isinstance(annual_norms, dict)
+                else None
+                for annual_norms in df['Нормативы по годам']
+            ],
+            index=df.index,
+            dtype='float64',
+        )
+        payments = pd.Series(
+            [
+                calculate_payment(norm, rate, kvr, kpr)
+                if pd.notna(norm)
+                else None
+                for norm, rate in zip(norms, df['Ставка платы, руб.'])
+            ],
+            index=df.index,
+            dtype='float64',
+        )
+        export_data[f'Норматив {year}, т/год'] = norms.tolist()
+        export_data[f'Сумма платы {year}, руб/год'] = payments.tolist()
+
+    yearly_df = pd.DataFrame(export_data)
+    total_row = {
+        'Наименование вещества': 'ИТОГО:',
+        'Ставка платы, руб.': np.nan,
+    }
+    for year in years:
+        norm_column = f'Норматив {year}, т/год'
+        payment_column = f'Сумма платы {year}, руб/год'
+        norm_values = pd.to_numeric(yearly_df[norm_column], errors='coerce')
+        payment_values = pd.to_numeric(yearly_df[payment_column], errors='coerce')
+        total_row[norm_column] = norm_values.sum(skipna=True)
+        total_row[payment_column] = payment_values.sum(skipna=True)
+
+    return pd.concat(
+        [yearly_df, pd.DataFrame([total_row])],
+        ignore_index=True,
+    )
+
+
+def create_excel_output(yearly_df, years):
+    """Создаёт книгу с полным восьмилетним расчётом."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        yearly_df.to_excel(
+            writer,
+            sheet_name='Расчёт по годам',
+            index=False,
+        )
+
+        yearly_sheet = writer.sheets['Расчёт по годам']
+        last_row = len(yearly_df) + 1
+        last_data_row = max(1, last_row - 1)
+        last_column = len(yearly_df.columns)
+        yearly_sheet.freeze_panes = 'C2'
+        yearly_sheet.auto_filter.ref = (
+            f'A1:{get_column_letter(last_column)}{last_data_row}'
+        )
+        yearly_sheet.sheet_view.showGridLines = False
+        yearly_sheet.row_dimensions[1].height = 42
+
+        payment_columns = {
+            4 + year_offset * 2
+            for year_offset, _year in enumerate(years)
+        }
+        payment_fill = PatternFill('solid', fgColor='E4F1E8')
+        thin_side = Side(style='thin', color='D9D9D9')
+        grid_border = Border(
+            left=thin_side,
+            right=thin_side,
+            top=thin_side,
+            bottom=thin_side,
+        )
+        for row_index in range(1, last_row + 1):
+            for column_index in range(1, last_column + 1):
+                cell = yearly_sheet.cell(
+                    row=row_index,
+                    column=column_index,
+                )
+                cell.border = grid_border
+                if column_index in payment_columns:
+                    cell.fill = payment_fill
+
+        for column_index in range(1, last_column + 1):
+            cell = yearly_sheet.cell(row=1, column=column_index)
+            cell.font = Font(bold=True, color='1F2937')
+            cell.alignment = Alignment(
+                horizontal='center',
+                vertical='center',
+                wrap_text=True,
+            )
+
+        yearly_sheet.column_dimensions['A'].width = 50
+        yearly_sheet.column_dimensions['B'].width = 18
+        for column_index in range(3, last_column + 1):
+            yearly_sheet.column_dimensions[
+                get_column_letter(column_index)
+            ].width = 20
+
+        for row_index in range(2, last_row + 1):
+            yearly_sheet.cell(row=row_index, column=2).number_format = '0.00'
+            for year_offset, _year in enumerate(years):
+                norm_column = 3 + year_offset * 2
+                payment_column = norm_column + 1
+                yearly_sheet.cell(
+                    row=row_index,
+                    column=norm_column,
+                ).number_format = '0.000000'
+                yearly_sheet.cell(
+                    row=row_index,
+                    column=payment_column,
+                ).number_format = '0.00'
+
+        total_border = Border(
+            left=thin_side,
+            right=thin_side,
+            top=Side(style='medium', color='315B7D'),
+            bottom=thin_side,
+        )
+        for column_index in range(1, last_column + 1):
+            cell = yearly_sheet.cell(row=last_row, column=column_index)
+            cell.font = Font(bold=True)
+            cell.border = total_border
+            if column_index == 2 or column_index >= 3:
+                cell.alignment = Alignment(
+                    horizontal='right',
+                    vertical='center',
+                    wrap_text=True,
+                )
+
+    output.seek(0)
+    return output
 
 def handle_emissions_file_change():
     """Фиксирует новый выбор файла и сбрасывает кэш предыдущего разбора."""
@@ -941,7 +1202,10 @@ if emissions_file is not None:
 
         df_result = parse_result.dataframe
         if parse_result.user_message:
-            st.error(parse_result.user_message)
+            if parse_result.error_category == 'modified_structure':
+                st.warning(parse_result.user_message)
+            else:
+                st.error(parse_result.user_message)
 
         if parse_result.success:
             
@@ -975,6 +1239,13 @@ if emissions_file is not None:
             substances_with_rate = df_result['Ставка платы, руб.'].notna().sum()
             
             st.success(f"Обработка завершена: найдено записей — {len(df_result)}")
+            if parse_result.warnings:
+                st.warning(
+                    "В годовых нормативах найдено пропусков или некорректных "
+                    f"значений: {len(parse_result.warnings)}. "
+                    "Они оставлены пустыми и не включаются в соответствующие "
+                    "годовые суммы."
+                )
             if ambiguous_positions:
                 positions_text = ", ".join(sorted(set(ambiguous_positions), key=int))
                 st.warning(
@@ -1000,6 +1271,10 @@ if emissions_file is not None:
             st.info(
                 f"**Год ставок:** {selected_year}. "
                 f"**Выбранные коэффициенты:** Квр = {kvr}, Кпр = {kpr}"
+            )
+            st.caption(
+                "Расчет в таблице выполнен для существующего положения. "
+                "Расчет по годам доступен в результатах Excel."
             )
             st.markdown('<div class="eco-table-label">Расчёт по веществам</div>', unsafe_allow_html=True)
             
@@ -1051,54 +1326,17 @@ if emissions_file is not None:
             # НОВЫЙ БЛОК: Кнопка для скачивания в формате Excel с итоговой строкой
             st.subheader("Экспорт результатов")
             
-            # Подготавливаем данные для экспорта
-            export_df = df_result[['Наименование вещества', 'Валовый выброс, т/год',
-                                   'Ставка платы, руб.', 'Сумма платы, руб/год']].copy()
-            
-            # Сначала считаем итоги по исходным значениям, затем округляем вывод.
-            export_df_with_total = add_total_row(export_df)
-            export_df_with_total = format_dataframe_for_display(export_df_with_total)
-            
-            # Создаем Excel файл в памяти
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # Записываем данные на лист "Расчет платы"
-                export_df_with_total.to_excel(
-                    writer,
-                    sheet_name='Расчет платы',
-                    index=False,
-                )
-                
-                # Настраиваем числовые форматы и ширину колонок
-                worksheet = writer.sheets['Расчет платы']
-                number_formats = {
-                    2: '0.000000',
-                    3: '0.00',
-                    4: '0.00',
-                }
-                for column_index, number_format in number_formats.items():
-                    for row_index in range(2, len(export_df_with_total) + 2):
-                        cell = worksheet.cell(row=row_index, column=column_index)
-                        cell.number_format = number_format
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
-                
-                # Выделяем итоговую строку жирным шрифтом
-                from openpyxl.styles import Font
-                last_row = len(export_df_with_total) + 1  # +1 для заголовка
-                for col in range(1, 5):  # 4 колонки
-                    cell = worksheet.cell(row=last_row, column=col)
-                    cell.font = Font(bold=True)
-            
+            yearly_export_df = build_yearly_export_dataframe(
+                df_result,
+                parse_result.years,
+                kvr,
+                kpr,
+            )
+            output = create_excel_output(
+                yearly_export_df,
+                parse_result.years,
+            )
+
             # Подготавливаем файл для скачивания
             output.seek(0)
             
