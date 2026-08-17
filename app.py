@@ -23,7 +23,9 @@ from analytics import (
 st.set_page_config(
     page_title="Расчет платы за выбросы в атмосферу",
     layout="wide",
-    initial_sidebar_state="expanded",
+    # Streamlit keeps the sidebar open on wide screens and collapses it on
+    # narrow ones, where it becomes an accessible slide-out panel.
+    initial_sidebar_state="auto",
 )
 
 def load_ecolytica_styles():
@@ -77,10 +79,10 @@ SUBSTANCE_NAMES = {
     '2904': 'Зола ТЭС мазутная /в пересчете на ванадий/',
     '0133': 'Кадмий и его соединения (кадмий дийодид (йодистый кадмий); кадмий динитрат (кадмий азотнокислый тетрагидрат); кадмий дихлорид (хлористый кадмий); кадмий оксид; кадмий сульфат (кадмий сульфат октагидрат) /в пересчете на кадмий/',
     '0126': 'Калий хлорид (калиевая соль соляной кислоты)',
-    '3119': 'Кальций карбонат (кальций углекислый; кальциевая соль карбоновой кислоты (1:1)',
+    '3119': 'Кальций карбонат (Кальций карбонат синтетический; кальций углекислый; кальциевая соль карбоновой кислоты (1:1)',
     '0128': 'Кальций оксид (кальций окись)',
     '0150': 'Натрий гидроксид (натр едкий)',
-    '0152': 'Натрий хлорид',
+    '0152': 'Натрий хлорид (Натриевая соль соляной кислоты)',
     '0155': 'Карбонат натрия (динатрий карбонат; натрий углекислый; натриевая соль угольной кислоты)',
     '1551': 'Кислота терефталевая (бензол-1,4-дикарбоновая кислота; п-фталевая кислота; бензол-п-дикарбоновая кислота)',
     '0134': 'Кобальт и его соединения (кобальт; кобальт оксид (кобальт окись, кобальт монооксид, кобальт (II) оксид); кобальт сульфат (кобальт моносульфат гептагидрат); диацетат кобальта (II) (кобальт (II) уксуснокислый тетрагидрат)) /в пересчете на кобальт/',
@@ -149,6 +151,7 @@ SUBSTANCE_NAMES = {
     '0620': 'Этенилбензол (стирол; винилбензол; фенилэтилен)',
     '0711': 'Антрацен',
     '0708': 'Нафталин (нафтален; нафтен)',
+    '0722': 'Пирен (бензо(d,e,f)фенантрен)',
     '0716': 'Фенантрен',
     '0810': 'Бромбензол',
     '0813': '1-Бромгептан (гептил бромистый; гептилбромид)',
@@ -253,6 +256,9 @@ SUBSTANCE_NAMES = {
 POSITION_CROSSWALK_PATH = (
     Path(__file__).parent / "data" / "position_2909_to_rate_codes.json"
 )
+ADDITIONAL_CODES_2909_PATH = (
+    Path(__file__).parent / "data" / "additional_substance_codes_2909.json"
+)
 PAYMENT_RATES_PATH = Path(__file__).parent / "data" / "payment_rates.json"
 
 
@@ -320,6 +326,68 @@ def load_position_crosswalk(path, expected_codes):
     return normalized
 
 
+def load_additional_code_crosswalk(
+    path,
+    primary_code_to_position,
+    valid_positions,
+):
+    """Загружает дополнительные коды, отсутствующие в основном справочнике."""
+    try:
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"файл {path.name} не найден") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"ошибка JSON в строке {exc.lineno}, столбце {exc.colno}"
+        ) from exc
+
+    if not isinstance(catalog, dict):
+        raise ValueError("ожидается объект верхнего уровня")
+    if catalog.get("expected_record_count") != 693:
+        raise ValueError("expected_record_count должен быть равен 693")
+    expected_group_counts = {"1": 4, "2": 653, "3": 28, "4": 8}
+    if catalog.get("counts_by_group") != expected_group_counts:
+        raise ValueError("counts_by_group не соответствует ожидаемому составу")
+
+    records = catalog.get("records")
+    if not isinstance(records, list) or len(records) != 693:
+        raise ValueError("раздел records должен содержать 693 записи")
+
+    normalized = {}
+    actual_group_counts = {group: 0 for group in expected_group_counts}
+    for index, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise ValueError(f"запись {index} должна быть объектом")
+
+        code = str(record.get("code", "")).strip()
+        name = record.get("name")
+        position = str(record.get("position", "")).strip()
+        group = str(record.get("group", "")).strip()
+        if not re.fullmatch(r"\d{4}", code):
+            raise ValueError(f"некорректный код {code!r} в записи {index}")
+        if code in normalized:
+            raise ValueError(f"дополнительный код {code} повторяется")
+        if code in primary_code_to_position:
+            raise ValueError(f"дополнительный код {code} уже есть в основном справочнике")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"для кода {code} отсутствует наименование")
+        if position not in valid_positions:
+            raise ValueError(f"для кода {code} указана неизвестная позиция {position!r}")
+        if group not in actual_group_counts:
+            raise ValueError(f"для кода {code} указана неизвестная группа {group!r}")
+
+        normalized[code] = {
+            "name": name.strip(),
+            "position": position,
+            "group": int(group),
+        }
+        actual_group_counts[group] += 1
+
+    if actual_group_counts != expected_group_counts:
+        raise ValueError("фактический состав групп не совпадает с counts_by_group")
+    return normalized
+
+
 try:
     POSITION_TO_RATE_CODES_2909 = load_position_crosswalk(
         POSITION_CROSSWALK_PATH,
@@ -329,8 +397,29 @@ except ValueError as exc:
     st.error(f"Не удалось загрузить таблицу соответствий № 2909-р: {exc}.")
     st.stop()
 
+CODE_TO_POSITION_2909 = {
+    code: position
+    for position, codes in POSITION_TO_RATE_CODES_2909.items()
+    for code in codes
+}
 
-def load_payment_rates(path):
+try:
+    ADDITIONAL_SUBSTANCES_2909 = load_additional_code_crosswalk(
+        ADDITIONAL_CODES_2909_PATH,
+        CODE_TO_POSITION_2909,
+        POSITION_TO_RATE_CODES_2909,
+    )
+except ValueError as exc:
+    st.error(f"Не удалось загрузить дополнительные коды № 2909-р: {exc}.")
+    st.stop()
+
+ADDITIONAL_CODE_TO_POSITION_2909 = {
+    code: record["position"]
+    for code, record in ADDITIONAL_SUBSTANCES_2909.items()
+}
+
+
+def load_payment_rates(path, expected_positions):
     """Загружает и проверяет справочник ставок платы по годам."""
     try:
         catalog = json.loads(path.read_text(encoding="utf-8"))
@@ -352,34 +441,56 @@ def load_payment_rates(path):
             raise ValueError(f"для {year_text} года ожидается объект")
 
         regulation = config.get("regulation")
-        raw_rates = config.get("rates")
+        raw_rates = config.get("rates_by_position")
         if not isinstance(regulation, str) or not regulation.strip():
             raise ValueError(f"для {year_text} года не указан regulation")
         if not isinstance(raw_rates, dict) or not raw_rates:
-            raise ValueError(f"для {year_text} года раздел rates отсутствует или пуст")
+            raise ValueError(
+                f"для {year_text} года раздел rates_by_position отсутствует или пуст"
+            )
 
         normalized_rates = {}
-        for code, rate in raw_rates.items():
-            code_text = str(code).strip()
-            if not re.fullmatch(r"\d{1,4}", code_text):
-                raise ValueError(f"некорректный код вещества {code!r} для {year_text} года")
-            normalized_code = code_text.zfill(4)
-            if normalized_code in normalized_rates:
-                raise ValueError(f"код {normalized_code} повторяется для {year_text} года")
+        for position, rate in raw_rates.items():
+            position_text = str(position).strip()
+            if not position_text.isdigit() or int(position_text) <= 0:
+                raise ValueError(
+                    f"некорректная позиция {position!r} для {year_text} года"
+                )
+            normalized_position = str(int(position_text))
+            if normalized_position in normalized_rates:
+                raise ValueError(
+                    f"позиция {normalized_position} повторяется для {year_text} года"
+                )
             if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not np.isfinite(rate) or rate < 0:
-                raise ValueError(f"некорректная ставка для кода {normalized_code} за {year_text} год")
-            normalized_rates[normalized_code] = float(rate)
+                raise ValueError(
+                    f"некорректная ставка для позиции {normalized_position} "
+                    f"за {year_text} год"
+                )
+            normalized_rates[normalized_position] = float(rate)
+
+        expected = set(expected_positions)
+        actual = set(normalized_rates)
+        if actual != expected:
+            missing = ", ".join(sorted(expected - actual, key=int)) or "нет"
+            extra = ", ".join(sorted(actual - expected, key=int)) or "нет"
+            raise ValueError(
+                f"состав позиций за {year_text} год не совпадает с № 2909-р "
+                f"(отсутствуют: {missing}; лишние: {extra})"
+            )
 
         normalized_years[year_text] = {
             "regulation": regulation.strip(),
-            "rates": normalized_rates,
+            "rates_by_position": normalized_rates,
         }
 
     return normalized_years
 
 
 try:
-    PAYMENT_RATES_BY_YEAR = load_payment_rates(PAYMENT_RATES_PATH)
+    PAYMENT_RATES_BY_YEAR = load_payment_rates(
+        PAYMENT_RATES_PATH,
+        POSITION_TO_RATE_CODES_2909,
+    )
 except ValueError as exc:
     st.error(f"Не удалось загрузить ставки платы: {exc}.")
     st.stop()
@@ -391,36 +502,15 @@ AVAILABLE_RATE_YEARS = sorted(
 )
 
 
-def find_rate_by_code(code, rates):
-    """Ищет ставку по коду вещества в справочнике выбранного года."""
-    if not code or pd.isna(code):
+def find_rate_by_position(position, rates_by_position):
+    """Ищет ставку по номеру пункта № 2409-р/2909-р."""
+    if not position or pd.isna(position):
         return None
 
-    code_str = str(code).strip()
-    if code_str in rates:
-        return rates[code_str]
-
-    if len(code_str) < 4:
-        return rates.get(code_str.zfill(4))
-
-    return None
-
-def find_rate_by_codes(codes, rates):
-    """Возвращает ставку для одного кода или группы с одинаковыми ставками."""
-    if not codes:
+    position_text = str(position).strip()
+    if not position_text.isdigit():
         return None
-
-    values = [find_rate_by_code(code, rates) for code in codes]
-    if any(value is None or pd.isna(value) for value in values):
-        return None
-
-    first_value = values[0]
-    if not all(
-        np.isclose(value, first_value, rtol=0, atol=1e-9)
-        for value in values[1:]
-    ):
-        return None
-    return first_value
+    return rates_by_position.get(str(int(position_text)))
 
 
 def extract_position_from_substance(substance):
@@ -429,20 +519,22 @@ def extract_position_from_substance(substance):
     return str(int(match.group(1))) if match else None
 
 
-def extract_rate_codes_from_substance(substance):
-    """Получает коды ставок по позиции № 2909-р или старому коду в тексте."""
+def extract_code_from_substance(substance):
+    """Извлекает четырехзначный код только из начала строки."""
+    code_match = re.match(r'^\s*(\d{4})(?=\s|$)', substance)
+    return code_match.group(1) if code_match else None
+
+
+def resolve_rate_position(substance):
+    """Определяет позицию напрямую или через код старого формата."""
     position = extract_position_from_substance(substance)
     if position is not None:
-        return list(POSITION_TO_RATE_CODES_2909.get(position, ()))
+        return position if position in POSITION_TO_RATE_CODES_2909 else None
 
-    code_match = re.search(r'(?<!\d)(\d{4})(?!\d)', substance)
-    return [code_match.group(1)] if code_match else []
-
-
-def extract_code_from_substance(substance):
-    """Совместимый интерфейс: возвращает первый найденный код ставки."""
-    codes = extract_rate_codes_from_substance(substance)
-    return codes[0] if codes else None
+    code = extract_code_from_substance(substance)
+    if code in CODE_TO_POSITION_2909:
+        return CODE_TO_POSITION_2909[code]
+    return ADDITIONAL_CODE_TO_POSITION_2909.get(code)
 
 def calculate_payment(emission, rate, kvr, kpr):
     """Рассчитывает плату за выбросы с учетом коэффициентов Квр и Кпр"""
@@ -455,6 +547,54 @@ def calculate_payment(emission, rate, kvr, kpr):
         return float(emission) * float(rate) * kvr * kpr
     except (TypeError, ValueError):
         return None
+
+
+def calculate_selected_year_dataframe(
+    dataframe,
+    selected_year,
+    rates_by_position,
+    kvr,
+    kpr,
+):
+    """Рассчитывает экран и первый лист по нормативу выбранного года."""
+    result = dataframe.copy()
+    norm_year = int(selected_year)
+    result['Валовый выброс, т/год'] = pd.to_numeric(
+        pd.Series(
+            [
+                annual_norms.get(norm_year)
+                if isinstance(annual_norms, dict)
+                else None
+                for annual_norms in result['Нормативы по годам']
+            ],
+            index=result.index,
+        ),
+        errors='coerce',
+    )
+    result['Ставка платы, руб.'] = pd.to_numeric(
+        pd.Series(
+            [
+                find_rate_by_position(position, rates_by_position)
+                for position in result['Позиция 2909-р']
+            ],
+            index=result.index,
+        ),
+        errors='coerce',
+    )
+    result['Сумма платы, руб/год'] = pd.to_numeric(
+        pd.Series(
+            [
+                calculate_payment(emission, rate, kvr, kpr)
+                for emission, rate in zip(
+                    result['Валовый выброс, т/год'],
+                    result['Ставка платы, руб.'],
+                )
+            ],
+            index=result.index,
+        ),
+        errors='coerce',
+    )
+    return result
 
 def parse_emissions_file(uploaded_file):
     """
@@ -478,7 +618,6 @@ def parse_emissions_file(uploaded_file):
         substances = []
         emissions = []
         codes = []
-        rate_codes_list = []
         positions_2909 = []
         row_numbers = []
         
@@ -507,9 +646,12 @@ def parse_emissions_file(uploaded_file):
                 # Очищаем название от кавычек если есть
                 substance = substance.strip('"').strip("'")
                 
-                position_2909 = extract_position_from_substance(substance)
-                rate_codes = extract_rate_codes_from_substance(substance)
-                code = rate_codes[0] if rate_codes else None
+                position_2909 = resolve_rate_position(substance)
+                code = (
+                    None
+                    if extract_position_from_substance(substance) is not None
+                    else extract_code_from_substance(substance)
+                )
                 
                 # Заменяем запятую на точку для числа и удаляем пробелы
                 emission_str = emission_str.replace(',', '.').replace(' ', '')
@@ -519,7 +661,6 @@ def parse_emissions_file(uploaded_file):
                     substances.append(substance)
                     emissions.append(emission)
                     codes.append(code)
-                    rate_codes_list.append(rate_codes)
                     positions_2909.append(position_2909)
                     row_numbers.append(row_num)
                 except ValueError:
@@ -531,7 +672,6 @@ def parse_emissions_file(uploaded_file):
             result_df = pd.DataFrame({
                 'Позиция 2909-р': positions_2909,
                 'Код вещества': codes,
-                'Коды ставок': rate_codes_list,
                 'Наименование вещества': substances,
                 'Валовый выброс, т/год': emissions
             })
@@ -563,7 +703,6 @@ def _empty_emissions_dataframe():
     return pd.DataFrame(columns=[
         'Позиция 2909-р',
         'Код вещества',
-        'Коды ставок',
         'Наименование вещества',
         'Валовый выброс, т/год',
         'Нормативы по годам',
@@ -737,22 +876,24 @@ def _build_emissions_dataframe(records, years):
         return _empty_emissions_dataframe()
 
     substances, emissions, codes = [], [], []
-    rate_codes_list, positions_2909, annual_values = [], [], []
+    positions_2909, annual_values = [], []
     first_year = years[0]
     for substance, annual_norms in records:
-        position_2909 = extract_position_from_substance(substance)
-        rate_codes = extract_rate_codes_from_substance(substance)
+        position_2909 = resolve_rate_position(substance)
+        code = (
+            None
+            if extract_position_from_substance(substance) is not None
+            else extract_code_from_substance(substance)
+        )
         substances.append(substance)
         emissions.append(annual_norms.get(first_year))
-        codes.append(rate_codes[0] if rate_codes else None)
-        rate_codes_list.append(rate_codes)
+        codes.append(code)
         positions_2909.append(position_2909)
         annual_values.append(annual_norms)
 
     return pd.DataFrame({
         'Позиция 2909-р': positions_2909,
         'Код вещества': codes,
-        'Коды ставок': rate_codes_list,
         'Наименование вещества': substances,
         'Валовый выброс, т/год': emissions,
         'Нормативы по годам': annual_values,
@@ -931,16 +1072,48 @@ def add_total_row(df):
     })
     return pd.concat([df, total_row], ignore_index=True)
 
-def build_yearly_export_dataframe(df, years, kvr, kpr):
-    """Формирует матрицу «норматив — сумма платы» для восьми лет."""
+
+def build_single_year_export_dataframe(df):
+    """Формирует первый лист с расчетом за выбранный год."""
+    columns = [
+        'Наименование вещества',
+        'Валовый выброс, т/год',
+        'Ставка платы, руб.',
+        'Сумма платы, руб/год',
+    ]
+    export_df = add_total_row(df[columns].copy())
+    return format_dataframe_for_display(export_df)
+
+
+def resolve_rate_year(norm_year, rates_by_year):
+    """Возвращает год ставки, используя последний доступный для будущих лет."""
+    year_text = str(norm_year)
+    if year_text in rates_by_year:
+        return year_text
+
+    numeric_years = sorted(
+        int(year)
+        for year in rates_by_year
+        if str(year).isdigit()
+    )
+    if numeric_years and int(norm_year) > numeric_years[-1]:
+        return str(numeric_years[-1])
+    return None
+
+
+def build_yearly_export_dataframe(df, years, rates_by_year, kvr, kpr):
+    """Формирует матрицу «норматив — ставка — сумма» для восьми лет."""
     export_data = {
         'Наименование вещества': df['Наименование вещества'].tolist(),
-        'Ставка платы, руб.': pd.to_numeric(
-            df['Ставка платы, руб.'], errors='coerce'
-        ).tolist(),
     }
 
     for year in years:
+        rate_year = resolve_rate_year(year, rates_by_year)
+        rates = (
+            rates_by_year[rate_year]['rates_by_position']
+            if rate_year is not None
+            else {}
+        )
         norms = pd.Series(
             [
                 annual_norms.get(year)
@@ -951,30 +1124,40 @@ def build_yearly_export_dataframe(df, years, kvr, kpr):
             index=df.index,
             dtype='float64',
         )
+        year_rates = pd.Series(
+            [
+                find_rate_by_position(position, rates)
+                for position in df['Позиция 2909-р']
+            ],
+            index=df.index,
+            dtype='float64',
+        )
         payments = pd.Series(
             [
                 calculate_payment(norm, rate, kvr, kpr)
                 if pd.notna(norm)
                 else None
-                for norm, rate in zip(norms, df['Ставка платы, руб.'])
+                for norm, rate in zip(norms, year_rates)
             ],
             index=df.index,
             dtype='float64',
         )
         export_data[f'Норматив {year}, т/год'] = norms.tolist()
+        export_data[f'Ставка {year}, руб./т'] = year_rates.tolist()
         export_data[f'Сумма платы {year}, руб/год'] = payments.tolist()
 
     yearly_df = pd.DataFrame(export_data)
     total_row = {
         'Наименование вещества': 'ИТОГО:',
-        'Ставка платы, руб.': np.nan,
     }
     for year in years:
         norm_column = f'Норматив {year}, т/год'
+        rate_column = f'Ставка {year}, руб./т'
         payment_column = f'Сумма платы {year}, руб/год'
         norm_values = pd.to_numeric(yearly_df[norm_column], errors='coerce')
         payment_values = pd.to_numeric(yearly_df[payment_column], errors='coerce')
         total_row[norm_column] = norm_values.sum(skipna=True)
+        total_row[rate_column] = np.nan
         total_row[payment_column] = payment_values.sum(skipna=True)
 
     return pd.concat(
@@ -983,34 +1166,32 @@ def build_yearly_export_dataframe(df, years, kvr, kpr):
     )
 
 
-def create_excel_output(yearly_df, years):
-    """Создаёт книгу с полным восьмилетним расчётом."""
+def create_excel_output(
+    single_year_df,
+    yearly_df,
+    years,
+    rates_by_year,
+    selected_year,
+):
+    """Создаёт книгу с однолетним и полным восьмилетним расчётом."""
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        single_year_df.to_excel(
+            writer,
+            sheet_name='Расчет платы',
+            index=False,
+        )
         yearly_df.to_excel(
             writer,
             sheet_name='Расчёт по годам',
             index=False,
         )
 
+        single_sheet = writer.sheets['Расчет платы']
         yearly_sheet = writer.sheets['Расчёт по годам']
-        last_row = len(yearly_df) + 1
-        last_data_row = max(1, last_row - 1)
-        last_column = len(yearly_df.columns)
-        yearly_sheet.freeze_panes = 'C2'
-        yearly_sheet.auto_filter.ref = (
-            f'A1:{get_column_letter(last_column)}{last_data_row}'
-        )
-        yearly_sheet.sheet_view.showGridLines = False
-        yearly_sheet.row_dimensions[1].height = 42
-
-        payment_columns = {
-            4 + year_offset * 2
-            for year_offset, _year in enumerate(years)
-        }
         payment_fill = PatternFill('solid', fgColor='E4F1E8')
         thin_side = Side(style='thin', color='D9D9D9')
         grid_border = Border(
@@ -1019,62 +1200,118 @@ def create_excel_output(yearly_df, years):
             top=thin_side,
             bottom=thin_side,
         )
-        for row_index in range(1, last_row + 1):
-            for column_index in range(1, last_column + 1):
-                cell = yearly_sheet.cell(
-                    row=row_index,
-                    column=column_index,
-                )
-                cell.border = grid_border
-                if column_index in payment_columns:
-                    cell.fill = payment_fill
-
-        for column_index in range(1, last_column + 1):
-            cell = yearly_sheet.cell(row=1, column=column_index)
-            cell.font = Font(bold=True, color='1F2937')
-            cell.alignment = Alignment(
-                horizontal='center',
-                vertical='center',
-                wrap_text=True,
-            )
-
-        yearly_sheet.column_dimensions['A'].width = 50
-        yearly_sheet.column_dimensions['B'].width = 18
-        for column_index in range(3, last_column + 1):
-            yearly_sheet.column_dimensions[
-                get_column_letter(column_index)
-            ].width = 20
-
-        for row_index in range(2, last_row + 1):
-            yearly_sheet.cell(row=row_index, column=2).number_format = '0.00'
-            for year_offset, _year in enumerate(years):
-                norm_column = 3 + year_offset * 2
-                payment_column = norm_column + 1
-                yearly_sheet.cell(
-                    row=row_index,
-                    column=norm_column,
-                ).number_format = '0.000000'
-                yearly_sheet.cell(
-                    row=row_index,
-                    column=payment_column,
-                ).number_format = '0.00'
-
         total_border = Border(
             left=thin_side,
             right=thin_side,
             top=Side(style='medium', color='315B7D'),
             bottom=thin_side,
         )
-        for column_index in range(1, last_column + 1):
-            cell = yearly_sheet.cell(row=last_row, column=column_index)
-            cell.font = Font(bold=True)
-            cell.border = total_border
-            if column_index == 2 or column_index >= 3:
+
+        sheet_configs = (
+            (single_sheet, single_year_df, {4}, {3}),
+            (
+                yearly_sheet,
+                yearly_df,
+                {4 + offset * 3 for offset, _year in enumerate(years)},
+                {3 + offset * 3 for offset, _year in enumerate(years)},
+            ),
+        )
+        for worksheet, dataframe, payment_columns, rate_columns in sheet_configs:
+            last_row = len(dataframe) + 1
+            last_data_row = max(1, last_row - 1)
+            last_column = len(dataframe.columns)
+            worksheet.freeze_panes = 'B2'
+            worksheet.auto_filter.ref = (
+                f'A1:{get_column_letter(last_column)}{last_data_row}'
+            )
+            worksheet.sheet_view.showGridLines = False
+            worksheet.row_dimensions[1].height = 42
+
+            for row_index in range(1, last_row + 1):
+                for column_index in range(1, last_column + 1):
+                    cell = worksheet.cell(row=row_index, column=column_index)
+                    cell.border = grid_border
+                    if column_index in payment_columns:
+                        cell.fill = payment_fill
+
+            for column_index in range(1, last_column + 1):
+                cell = worksheet.cell(row=1, column=column_index)
+                cell.font = Font(bold=True, color='1F2937')
                 cell.alignment = Alignment(
-                    horizontal='right',
+                    horizontal='center',
                     vertical='center',
                     wrap_text=True,
                 )
+
+            worksheet.column_dimensions['A'].width = 50
+            for column_index in range(2, last_column + 1):
+                worksheet.column_dimensions[
+                    get_column_letter(column_index)
+                ].width = 20
+
+            for row_index in range(2, last_row + 1):
+                for column_index in range(2, last_column + 1):
+                    worksheet.cell(
+                        row=row_index,
+                        column=column_index,
+                    ).number_format = (
+                        '0.000000'
+                        if column_index not in rate_columns | payment_columns
+                        else '0.00'
+                    )
+
+            for column_index in range(1, last_column + 1):
+                cell = worksheet.cell(row=last_row, column=column_index)
+                cell.font = Font(bold=True)
+                cell.border = total_border
+
+        single_note_row = len(single_year_df) + 3
+        single_sheet.merge_cells(
+            start_row=single_note_row,
+            start_column=1,
+            end_row=single_note_row,
+            end_column=len(single_year_df.columns),
+        )
+        single_note_cell = single_sheet.cell(row=single_note_row, column=1)
+        single_note_cell.value = (
+            f'Примечание: расчёт выполнен по нормативам и ставкам '
+            f'за {selected_year} год.'
+        )
+        single_note_cell.font = Font(italic=True, color='595959')
+        single_note_cell.alignment = Alignment(wrap_text=True, vertical='top')
+        single_sheet.row_dimensions[single_note_row].height = 28
+
+        fallback_years = [
+            year
+            for year in years
+            if resolve_rate_year(year, rates_by_year) != str(year)
+            and resolve_rate_year(year, rates_by_year) is not None
+        ]
+        if fallback_years:
+            fallback_rate_year = resolve_rate_year(fallback_years[0], rates_by_year)
+            years_text = (
+                str(fallback_years[0])
+                if len(fallback_years) == 1
+                else f'{fallback_years[0]}–{fallback_years[-1]}'
+            )
+            note_row = len(yearly_df) + 3
+            last_column = len(yearly_df.columns)
+            yearly_sheet.merge_cells(
+                start_row=note_row,
+                start_column=1,
+                end_row=note_row,
+                end_column=last_column,
+            )
+            note_cell = yearly_sheet.cell(row=note_row, column=1)
+            note_cell.value = (
+                f'Примечание: для расчёта платы за {years_text} годы условно '
+                f'применены ставки платы, установленные на {fallback_rate_year} '
+                'год, в связи с отсутствием утверждённых ставок на указанный '
+                'период.'
+            )
+            note_cell.font = Font(italic=True, color='595959')
+            note_cell.alignment = Alignment(wrap_text=True, vertical='top')
+            yearly_sheet.row_dimensions[note_row].height = 32
 
     output.seek(0)
     return output
@@ -1139,14 +1376,20 @@ with st.sidebar:
     )
     st.header("Настройки расчёта")
 
+    current_rate_year = str(datetime.now().year)
+    default_rate_year_index = (
+        AVAILABLE_RATE_YEARS.index(current_rate_year)
+        if current_rate_year in AVAILABLE_RATE_YEARS
+        else 0
+    )
     selected_year = st.selectbox(
         "Год ставок платы",
         options=AVAILABLE_RATE_YEARS,
-        index=0,
+        index=default_rate_year_index,
         help="Список формируется автоматически из data/payment_rates.json",
     )
     selected_rate_config = PAYMENT_RATES_BY_YEAR[selected_year]
-    selected_rates = selected_rate_config["rates"]
+    selected_rates_by_position = selected_rate_config["rates_by_position"]
     st.caption(selected_rate_config["regulation"])
 
     st.subheader("Коэффициенты для расчета платы")
@@ -1173,10 +1416,21 @@ with st.sidebar:
         search_code = st.text_input("Введите код вещества (4 цифры)")
         if search_code:
             code_padded = search_code.zfill(4)
-            if code_padded in selected_rates:
-                name = SUBSTANCE_NAMES.get(code_padded, "Наименование не указано")
-                rate = selected_rates[code_padded]
-                st.success(f"**{code_padded}**: {name[:100]}...")
+            position = CODE_TO_POSITION_2909.get(code_padded)
+            additional_record = ADDITIONAL_SUBSTANCES_2909.get(code_padded)
+            if position is None and additional_record is not None:
+                position = additional_record["position"]
+            rate = find_rate_by_position(position, selected_rates_by_position)
+            if rate is not None:
+                name = SUBSTANCE_NAMES.get(
+                    code_padded,
+                    additional_record["name"]
+                    if additional_record is not None
+                    else "Наименование не указано",
+                )
+                st.success(
+                    f"**{code_padded}**, пункт № {position}: {name[:100]}..."
+                )
                 st.metric("Ставка", f"{rate:,.2f} руб/т")
             else:
                 st.warning("Код не найден")
@@ -1200,7 +1454,11 @@ if emissions_file is not None:
         else:
             parse_result = st.session_state['_parsed_upload_result']
 
-        df_result = parse_result.dataframe
+        df_result = (
+            parse_result.dataframe.copy()
+            if parse_result.dataframe is not None
+            else None
+        )
         if parse_result.user_message:
             if parse_result.error_category == 'modified_structure':
                 st.warning(parse_result.user_message)
@@ -1208,30 +1466,17 @@ if emissions_file is not None:
                 st.error(parse_result.user_message)
 
         if parse_result.success:
-            
-            # Добавляем расчет платы
-            payments = []
-            rates_used = []
-            ambiguous_positions = []
-            
-            for idx, row in df_result.iterrows():
-                rate_codes = row['Коды ставок']
-                emission = row['Валовый выброс, т/год']
-
-                rate = find_rate_by_codes(rate_codes, selected_rates)
-                if len(rate_codes) > 1 and rate is None:
-                    ambiguous_positions.append(row['Позиция 2909-р'])
-                
-                payment = calculate_payment(emission, rate, kvr, kpr)
-                payments.append(payment)
-                rates_used.append(rate)
-            
-            df_result['Ставка платы, руб.'] = pd.to_numeric(
-                pd.Series(rates_used, index=df_result.index), errors='coerce'
+            df_result = calculate_selected_year_dataframe(
+                df_result,
+                selected_year,
+                selected_rates_by_position,
+                kvr,
+                kpr,
             )
-            df_result['Сумма платы, руб/год'] = pd.to_numeric(
-                pd.Series(payments, index=df_result.index), errors='coerce'
-            )
+            unresolved_substances = df_result.loc[
+                df_result['Ставка платы, руб.'].isna(),
+                'Наименование вещества',
+            ].tolist()
             
             # Считаем итоги
             total_payment = df_result['Сумма платы, руб/год'].sum(skipna=True)
@@ -1246,12 +1491,12 @@ if emissions_file is not None:
                     "Они оставлены пустыми и не включаются в соответствующие "
                     "годовые суммы."
                 )
-            if ambiguous_positions:
-                positions_text = ", ".join(sorted(set(ambiguous_positions), key=int))
+            if unresolved_substances:
+                substances_text = "; ".join(unresolved_substances[:10])
+                suffix = "…" if len(unresolved_substances) > 10 else ""
                 st.warning(
-                    "Не удалось однозначно определить ставку для "
-                    f"позиций № 2909-р: {positions_text}. "
-                    "Связанные коды ставок отсутствуют или имеют разные значения."
+                    "Не найдена позиция или ставка № 2409-р/2909-р для: "
+                    f"{substances_text}{suffix}"
                 )
             
             # Отображаем итоговую сумму
@@ -1269,11 +1514,11 @@ if emissions_file is not None:
             
             # Отображаем выбранные коэффициенты
             st.info(
-                f"**Год ставок:** {selected_year}. "
+                f"**Год норматива и ставок:** {selected_year}. "
                 f"**Выбранные коэффициенты:** Квр = {kvr}, Кпр = {kpr}"
             )
             st.caption(
-                "Расчет в таблице выполнен для существующего положения. "
+                f"Расчет в таблице выполнен по нормативу {selected_year} года. "
                 "Расчет по годам доступен в результатах Excel."
             )
             st.markdown('<div class="eco-table-label">Расчёт по веществам</div>', unsafe_allow_html=True)
@@ -1285,7 +1530,7 @@ if emissions_file is not None:
             display_df = format_dataframe_for_display(display_df)
             st.dataframe(
                 display_df,
-                use_container_width=True,
+                width="stretch",
                 height=600,
                 column_config={
                     'Валовый выброс, т/год': st.column_config.NumberColumn(
@@ -1325,16 +1570,23 @@ if emissions_file is not None:
             
             # НОВЫЙ БЛОК: Кнопка для скачивания в формате Excel с итоговой строкой
             st.subheader("Экспорт результатов")
-            
+
+            single_year_export_df = build_single_year_export_dataframe(
+                df_result
+            )
             yearly_export_df = build_yearly_export_dataframe(
                 df_result,
                 parse_result.years,
+                PAYMENT_RATES_BY_YEAR,
                 kvr,
                 kpr,
             )
             output = create_excel_output(
+                single_year_export_df,
                 yearly_export_df,
                 parse_result.years,
+                PAYMENT_RATES_BY_YEAR,
+                selected_year,
             )
 
             # Подготавливаем файл для скачивания
@@ -1350,7 +1602,7 @@ if emissions_file is not None:
                 file_name=filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 on_click=handle_excel_download,
-                use_container_width=True,
+                width="stretch",
             )
                 
         elif parse_result.error_category == 'no_data':

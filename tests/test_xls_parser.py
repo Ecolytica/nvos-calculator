@@ -8,6 +8,107 @@ import app
 SS_NS = "urn:schemas-microsoft-com:office:spreadsheet"
 
 
+def test_requested_substance_synonyms():
+    assert "Кальций карбонат синтетический" in app.SUBSTANCE_NAMES["3119"]
+    assert app.SUBSTANCE_NAMES["0152"] == (
+        "Натрий хлорид (Натриевая соль соляной кислоты)"
+    )
+
+
+def test_resolves_position_directly_or_from_legacy_code():
+    assert app.resolve_rate_position("(14) Взвешенные вещества") == "14"
+    assert app.resolve_rate_position("2902 Взвешенные вещества") == "14"
+    assert app.resolve_rate_position("2907 Пыль неорганическая") == "51"
+    assert app.resolve_rate_position("2908 Пыль неорганическая") == "51"
+    assert app.resolve_rate_position("2909 Пыль неорганическая") == "51"
+    assert app.resolve_rate_position("(999) Неизвестное вещество") is None
+    assert app.resolve_rate_position("9999 Неизвестное вещество") is None
+
+
+def test_additional_code_catalog_is_disjoint_and_complete():
+    records = app.ADDITIONAL_SUBSTANCES_2909
+    assert len(records) == 693
+    assert set(records).isdisjoint(app.CODE_TO_POSITION_2909)
+    assert {
+        group: sum(record["group"] == group for record in records.values())
+        for group in range(1, 5)
+    } == {1: 4, 2: 653, 3: 28, 4: 8}
+
+
+def test_resolves_additional_codes_without_matching_by_name():
+    assert app.resolve_rate_position("0385 Фтористые соединения") == "67"
+    assert app.resolve_rate_position("0102 Алюминия гидроксид") == "14"
+    assert app.resolve_rate_position("0124 Кадмий нитрат") == "28"
+    assert app.resolve_rate_position("0402 Бутан") == "76"
+    assert app.resolve_rate_position("0122 Железо трихлорид") == "25"
+    assert app.resolve_rate_position("0242 Железо пентакарбонил") is None
+    assert app.resolve_rate_position("Кадмий нитрат") is None
+
+
+def test_explicit_position_has_priority_and_code_must_start_the_line():
+    assert app.resolve_rate_position("(14) 0124 Кадмий нитрат") == "14"
+    assert app.extract_code_from_substance("Вещество 0124") is None
+    assert app.resolve_rate_position("Вещество 0124") is None
+
+
+def test_direct_position_and_legacy_code_use_the_same_rate():
+    dataframe = app._build_emissions_dataframe(
+        [
+            ("(14) Взвешенные вещества", {2026: 1.0}),
+            ("2902 Взвешенные вещества", {2026: 1.0}),
+        ],
+        (2026,),
+    )
+
+    assert dataframe["Позиция 2909-р"].tolist() == ["14", "14"]
+    assert dataframe["Код вещества"].tolist() == [None, "2902"]
+    rates = app.PAYMENT_RATES_BY_YEAR["2026"]["rates_by_position"]
+    assert [
+        app.find_rate_by_position(position, rates)
+        for position in dataframe["Позиция 2909-р"]
+    ] == [65.5, 65.5]
+
+
+def test_payment_rates_cover_2026_to_2030():
+    expected_2902_rates = {
+        "2026": 65.5,
+        "2027": 196.6,
+        "2028": 327.7,
+        "2029": 655.3,
+        "2030": 1310.6,
+    }
+
+    assert set(app.PAYMENT_RATES_BY_YEAR) == set(expected_2902_rates)
+    assert app.AVAILABLE_RATE_YEARS == ["2030", "2029", "2028", "2027", "2026"]
+
+    for year, expected_rate in expected_2902_rates.items():
+        rates = app.PAYMENT_RATES_BY_YEAR[year]["rates_by_position"]
+        assert len(rates) == 199
+        assert set(rates) == {str(position) for position in range(1, 200)}
+        assert rates["14"] == expected_rate
+
+    rates_2026 = app.PAYMENT_RATES_BY_YEAR["2026"]["rates_by_position"]
+    assert rates_2026["8"] == 9_829_531.5
+    assert rates_2026["23"] == 21_144_530_000.0
+
+
+def test_pyrene_position_and_rates():
+    assert len(app.POSITION_TO_RATE_CODES_2909) == 199
+    assert app.POSITION_TO_RATE_CODES_2909["100"] == ("0722",)
+    assert app.SUBSTANCE_NAMES["0722"] == "Пирен (бензо(d,e,f)фенантрен)"
+
+    expected_rates = {
+        "2026": 9_829.5,
+        "2027": 29_488.6,
+        "2028": 49_147.7,
+        "2029": 98_295.3,
+        "2030": 196_590.6,
+    }
+    for year, expected_rate in expected_rates.items():
+        rates = app.PAYMENT_RATES_BY_YEAR[year]["rates_by_position"]
+        assert rates["100"] == expected_rate
+
+
 def _xls(rows):
     xml_rows = []
     for row in rows:
@@ -53,6 +154,7 @@ def test_parses_object_format():
 
     assert result.success
     assert result.dataframe["Код вещества"].tolist() == ["0155", "0301"]
+    assert result.dataframe["Позиция 2909-р"].tolist() == ["34", "1"]
     assert result.dataframe["Валовый выброс, т/год"].tolist() == pytest.approx(
         [0.000036, 8.369627]
     )
@@ -398,27 +500,81 @@ def test_rejects_modified_structure_on_repeated_page():
     assert result.error_category == "modified_structure"
 
 
-def test_builds_yearly_export_in_requested_column_order():
+def _test_rates_by_year():
+    return {
+        str(year): {"rates_by_position": {"14": float(year - 2025)}}
+        for year in range(2026, 2031)
+    }
+
+
+def test_selected_year_uses_matching_norm_and_rate():
+    source = app.pd.DataFrame({
+        "Наименование вещества": ["Взвешенные вещества"],
+        "Позиция 2909-р": ["14"],
+        "Валовый выброс, т/год": [1.0],
+        "Нормативы по годам": [{2026: 1.0, 2027: 2.0, 2028: 3.0}],
+    })
+
+    calculated = app.calculate_selected_year_dataframe(
+        source,
+        "2028",
+        _test_rates_by_year()["2028"]["rates_by_position"],
+        1,
+        25,
+    )
+
+    assert calculated.loc[0, "Валовый выброс, т/год"] == pytest.approx(3.0)
+    assert calculated.loc[0, "Ставка платы, руб."] == pytest.approx(3.0)
+    assert calculated.loc[0, "Сумма платы, руб/год"] == pytest.approx(225.0)
+
+
+def test_builds_single_year_export_with_total():
+    df = app.pd.DataFrame({
+        "Наименование вещества": ["Взвешенные вещества"],
+        "Валовый выброс, т/год": [2.0],
+        "Ставка платы, руб.": [5.0],
+        "Сумма платы, руб/год": [10.0],
+    })
+
+    single = app.build_single_year_export_dataframe(df)
+
+    assert single.columns.tolist() == [
+        "Наименование вещества",
+        "Валовый выброс, т/год",
+        "Ставка платы, руб.",
+        "Сумма платы, руб/год",
+    ]
+    assert single.iloc[-1]["Наименование вещества"] == "ИТОГО:"
+    assert single.iloc[-1]["Валовый выброс, т/год"] == pytest.approx(2.0)
+    assert single.iloc[-1]["Сумма платы, руб/год"] == pytest.approx(10.0)
+
+
+def test_builds_yearly_export_with_year_specific_and_fallback_rates():
     years = tuple(range(2026, 2034))
     norms = {year: float(offset + 1) for offset, year in enumerate(years)}
     df = app.pd.DataFrame({
         "Наименование вещества": ["0155 Натрия карбонат"],
-        "Ставка платы, руб.": [10.0],
+        "Позиция 2909-р": ["14"],
         "Нормативы по годам": [norms],
     })
 
-    yearly = app.build_yearly_export_dataframe(df, years, 1, 25)
+    yearly = app.build_yearly_export_dataframe(
+        df, years, _test_rates_by_year(), 1, 25
+    )
 
-    expected_columns = ["Наименование вещества", "Ставка платы, руб."]
+    expected_columns = ["Наименование вещества"]
     for year in years:
         expected_columns.extend([
             f"Норматив {year}, т/год",
+            f"Ставка {year}, руб./т",
             f"Сумма платы {year}, руб/год",
         ])
     assert yearly.columns.tolist() == expected_columns
     assert yearly.loc[0, "Норматив 2027, т/год"] == pytest.approx(2.0)
-    assert yearly.loc[0, "Сумма платы 2027, руб/год"] == pytest.approx(500.0)
-    assert yearly.loc[1, "Сумма платы 2033, руб/год"] == pytest.approx(2000.0)
+    assert yearly.loc[0, "Ставка 2027, руб./т"] == pytest.approx(2.0)
+    assert yearly.loc[0, "Сумма платы 2027, руб/год"] == pytest.approx(100.0)
+    assert yearly.loc[0, "Ставка 2033, руб./т"] == pytest.approx(5.0)
+    assert yearly.loc[1, "Сумма платы 2033, руб/год"] == pytest.approx(1000.0)
 
 
 def test_sums_available_values_when_norm_is_missing():
@@ -427,13 +583,17 @@ def test_sums_available_values_when_norm_is_missing():
     norms[2029] = None
     df = app.pd.DataFrame({
         "Наименование вещества": ["0155 Натрия карбонат"],
-        "Ставка платы, руб.": [10.0],
+        "Позиция 2909-р": ["14"],
         "Нормативы по годам": [norms],
     })
 
-    yearly = app.build_yearly_export_dataframe(df, years, 1, 1)
+    yearly = app.build_yearly_export_dataframe(
+        df, years, _test_rates_by_year(), 1, 1
+    )
 
     assert app.pd.isna(yearly.loc[0, "Норматив 2029, т/год"])
+    assert yearly.loc[0, "Ставка 2029, руб./т"] == pytest.approx(4.0)
+    assert app.pd.isna(yearly.loc[0, "Сумма платы 2029, руб/год"])
     assert yearly.loc[1, "Норматив 2029, т/год"] == 0.0
     assert yearly.loc[1, "Сумма платы 2029, руб/год"] == 0.0
 
@@ -443,47 +603,79 @@ def test_missing_rate_keeps_payment_blank_and_excludes_it_from_total():
     norms = {year: 1.0 for year in years}
     df = app.pd.DataFrame({
         "Наименование вещества": ["Вещество 1", "Вещество 2"],
-        "Ставка платы, руб.": [10.0, None],
+        "Позиция 2909-р": ["14", None],
         "Нормативы по годам": [norms, norms],
     })
 
-    yearly = app.build_yearly_export_dataframe(df, years, 1, 1)
+    yearly = app.build_yearly_export_dataframe(
+        df, years, _test_rates_by_year(), 1, 1
+    )
 
+    assert app.pd.isna(yearly.loc[1, "Ставка 2026, руб./т"])
     assert app.pd.isna(yearly.loc[1, "Сумма платы 2026, руб/год"])
-    assert yearly.loc[2, "Сумма платы 2026, руб/год"] == 10.0
+    assert yearly.loc[2, "Сумма платы 2026, руб/год"] == 1.0
 
 
-def test_excel_output_contains_only_styled_yearly_sheet():
+def test_excel_output_contains_two_styled_sheets_and_fallback_note():
     from openpyxl import load_workbook
 
     years = tuple(range(2026, 2034))
     norms = {year: 1.0 for year in years}
+    source_df = app.pd.DataFrame({
+        "Наименование вещества": ["0155 Натрия карбонат"],
+        "Позиция 2909-р": ["14"],
+        "Валовый выброс, т/год": [1.0],
+        "Ставка платы, руб.": [1.0],
+        "Сумма платы, руб/год": [1.0],
+        "Нормативы по годам": [norms],
+    })
+    single_sheet = app.build_single_year_export_dataframe(source_df)
     yearly_sheet = app.build_yearly_export_dataframe(
-        app.pd.DataFrame({
-            "Наименование вещества": ["0155 Натрия карбонат"],
-            "Ставка платы, руб.": [10.0],
-            "Нормативы по годам": [norms],
-        }),
+        source_df,
         years,
+        _test_rates_by_year(),
         1,
         1,
     )
 
     workbook = load_workbook(
-        app.create_excel_output(yearly_sheet, years),
+        app.create_excel_output(
+            single_sheet,
+            yearly_sheet,
+            years,
+            _test_rates_by_year(),
+            "2028",
+        ),
         data_only=False,
     )
 
-    assert workbook.sheetnames == ["Расчёт по годам"]
+    assert workbook.sheetnames == ["Расчет платы", "Расчёт по годам"]
+    single = workbook["Расчет платы"]
+    assert single["A1"].value == "Наименование вещества"
+    assert single["B1"].value == "Валовый выброс, т/год"
+    assert single["C1"].value == "Ставка платы, руб."
+    assert single["D1"].value == "Сумма платы, руб/год"
+    assert single.freeze_panes == "B2"
+    single_note_row = len(single_sheet) + 3
+    single_note = single.cell(row=single_note_row, column=1).value
+    assert single_note == (
+        "Примечание: расчёт выполнен по нормативам и ставкам за 2028 год."
+    )
+    assert f"A{single_note_row}:D{single_note_row}" in {
+        str(cell_range) for cell_range in single.merged_cells.ranges
+    }
+
     yearly = workbook["Расчёт по годам"]
     assert yearly["A1"].value == "Наименование вещества"
-    assert yearly["B1"].value == "Ставка платы, руб."
-    assert yearly["C1"].value == "Норматив 2026, т/год"
+    assert yearly["B1"].value == "Норматив 2026, т/год"
+    assert yearly["C1"].value == "Ставка 2026, руб./т"
     assert yearly["D1"].value == "Сумма платы 2026, руб/год"
-    assert yearly.freeze_panes == "C2"
+    assert yearly.freeze_panes == "B2"
 
-    payment_columns = set(range(4, 19, 2))
-    for row in yearly.iter_rows():
+    payment_columns = set(range(4, 26, 3))
+    rate_columns = set(range(3, 26, 3))
+    total_row = len(yearly_sheet) + 1
+    for row in yearly.iter_rows(min_row=1, max_row=total_row):
         for cell in row:
             if cell.column in payment_columns:
                 assert cell.fill.fill_type == "solid"
@@ -494,5 +686,16 @@ def test_excel_output_contains_only_styled_yearly_sheet():
             assert cell.border.left.style == "thin"
             assert cell.border.right.style == "thin"
             assert cell.border.bottom.style == "thin"
-            expected_top = "medium" if cell.row == yearly.max_row else "thin"
+            expected_top = "medium" if cell.row == total_row else "thin"
             assert cell.border.top.style == expected_top
+
+    note_row = len(yearly_sheet) + 3
+    note = yearly.cell(row=note_row, column=1).value
+    assert note == (
+        "Примечание: для расчёта платы за 2031–2033 годы условно применены "
+        "ставки платы, установленные на 2030 год, в связи с отсутствием "
+        "утверждённых ставок на указанный период."
+    )
+    assert f"A{note_row}:Y{note_row}" in {
+        str(cell_range) for cell_range in yearly.merged_cells.ranges
+    }
